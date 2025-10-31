@@ -12,6 +12,7 @@ import WalkinPage from "./pages/WalkinPage";
 // import ConsentPage from "./pages/ConsentPage";
 import ReasonPage from "./pages/ReasonPage";
 import PaymentPage from "./pages/PaymentPage";
+import DiagnosticsPage from "./pages/DiagnosticsPage";
 import TokenPage from "./pages/TokenPage";
 import QueuePage from "./pages/QueuePage";
 import LabPage from "./pages/LabPage";
@@ -41,6 +42,7 @@ const App = () => (
           {/* <Route path="/consent" element={<ConsentPage />} /> */}
           <Route path="/reason" element={<ReasonPage />} />
           {/* <Route path="/pay" element={<PaymentPage />} /> */}
+          <Route path="/diagnostics" element={<DiagnosticsPage />} />
           <Route path="/payment" element={<PaymentPage />} />
           <Route path="/token" element={<TokenPage />} />
           <Route path="/queue" element={<QueuePage />} />

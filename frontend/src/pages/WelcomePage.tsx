@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Globe, ChevronRight, QrCode, Smartphone, TestTube, Pill } from "lucide-react";
+import { Globe, ChevronRight, QrCode, Smartphone, TestTube, Pill, Activity } from "lucide-react";
 import KioskLayout from "@/components/KioskLayout";
 import { useTranslation, getStoredLanguage, setStoredLanguage, type Language } from "@/lib/i18n";
 
@@ -44,6 +44,12 @@ export default function WelcomePage() {
       title: "Pharmacy",
       description: "Purchase medicines or pickup orders",
       action: () => navigate('/pharmacy')
+    },
+    {
+      icon: Activity,
+      title: "Diagnostics",
+      description: "CT, MRI, X-Ray, USG services",
+      action: () => navigate('/diagnostics')
     }
   ];
 
