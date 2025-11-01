@@ -8,67 +8,16 @@ services:
     plan: free
     healthCheckPath: /health
     autoDeploy: true
-    envVars:
-      - key: FRONTEND_URL
-        value: ""      # set AFTER frontend goes live
-      - key: CORS_EXTRA
-        value: ""
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: AWS_ACCESS_KEY_ID
-        sync: false
-      - key: AWS_SECRET_ACCESS_KEY
-        sync: false
-      - key: AWS_REGION
-        value: "us-west-2"
-      - key: AUDIO_BUCKET_NAME
-        value: "medmitra-audio-bucket"
-      - key: DDB_TABLE_PATIENTS
-        value: "medmitra_patients"
-      - key: DDB_TABLE_KIOSK_OTP
-        value: "kiosk_otp"
-      - key: DDB_TABLE_APPOINTMENTS
-        value: "medmitra-appointments"
-      - key: DDB_TABLE_SLOTS
-        value: "medmitra_appointment_slots"
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-      - key: TWILIO_FROM_NUMBER
-        sync: false
-      - key: RAZORPAY_KEY_ID
-        sync: false
-      - key: RAZORPAY_KEY_SECRET
-        sync: false
-      - key: RAZORPAY_AUTO_CAPTURE
-        value: "true"
-      - key: OTP_CODE_LENGTH
-        value: "6"
-      - key: OTP_TTL_SECONDS
-        value: "300"
-      - key: OTP_MAX_ATTEMPTS
-        value: "5"
 
-  # Node backend
+  # Node backend (Express)
   - type: web
     name: medmitra-node
     env: docker
-    rootDir: node-backend        # ← change from "."
-    dockerfilePath: Dockerfile   # ← it's inside node-backend now
+    rootDir: node-backend        # << important: build context is the folder
+    dockerfilePath: Dockerfile   # << Dockerfile lives inside node-backend
     plan: free
     healthCheckPath: /healthz
     autoDeploy: true
-    envVars:
-      - key: ALLOWED_ORIGIN
-        value: ""                # set after frontend is live
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-      - key: TWILIO_FROM_NUMBER
-        sync: false
-
 
   # Frontend (Vite)
   - type: web
@@ -77,12 +26,4 @@ services:
     rootDir: frontend
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
-    envVars:
-      - key: NODE_VERSION
-        value: "20"
-      # set these AFTER the backends are live:
-      - key: VITE_API_BASE_URL
-        value: ""  # e.g. https://medmitra-fastapi.onrender.com
-      - key: VITE_NODE_API_BASE_URL
-        value: ""  # e.g. https://medmitra-node.onrender.com
     autoDeploy: true
