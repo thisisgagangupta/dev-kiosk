@@ -13,7 +13,7 @@ const {
   OTP_MAX_ATTEMPTS = "5",
 } = process.env;
 
-if (!COGNITO_USER_POOL_ID) throw new Error("Missing COGNITO_USER_POOL_ID");
+// if (!COGNITO_USER_POOL_ID) throw new Error("Missing COGNITO_USER_POOL_ID");
 
 AWS.config.update({ region: AWS_REGION });
 const cognito = new AWS.CognitoIdentityServiceProvider({ apiVersion: "2016-04-18" });
