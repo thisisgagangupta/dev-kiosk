@@ -3,14 +3,6 @@ import { useCallback, useRef, useState } from "react";
 // @ts-ignore: RecordRTC ships its own types
 import RecordRTC from "recordrtc";
 
-/**
- * Hook supports two modes:
- * - "oneshot" (default): start() records; stop() returns the FINAL transcript string once.
- * - "stream": emits per-slice transcripts via onText while recording.
- *
- * ReasonPage wants "oneshot".
- */
-
 const SLICE_MS = 5000;      // used only in "stream" mode
 const TARGET_RATE = 16000;  // STT-friendly (Whisper/4o-transcribe)
 
