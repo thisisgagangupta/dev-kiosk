@@ -54,20 +54,21 @@ services:
   - type: web
     name: medmitra-node
     env: docker
-    rootDir: .
-    dockerfilePath: node-backend/Dockerfile
+    rootDir: node-backend        # ← change from "."
+    dockerfilePath: Dockerfile   # ← it's inside node-backend now
     plan: free
     healthCheckPath: /healthz
     autoDeploy: true
     envVars:
       - key: ALLOWED_ORIGIN
-        value: ""      # set AFTER frontend goes live (comma-separated)
+        value: ""                # set after frontend is live
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN
         sync: false
       - key: TWILIO_FROM_NUMBER
         sync: false
+
 
   # Frontend (Vite)
   - type: web
