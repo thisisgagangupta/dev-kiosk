@@ -188,11 +188,17 @@ export default function useVoiceCapture({
             });
             if (!resp.ok) {
               const txt = await resp.text().catch(() => "");
-              throw new Error(
-                `STT ${resp.status} at ${API_BASE_URL}/api/transcribe-audio: ${txt || "not found"}`
-              );
+              throw new Error(`STT ${resp.status} at ${API_BASE_URL || "(relative)"}/api/transcribe-audio: ${txt || "no body"}`);
             }
+            
+            const ctype = resp.headers.get("content-type") || "";
+            if (!ctype.includes("application/json")) {
+              const txt = await resp.text().catch(() => "");
+              throw new Error(`STT response was not JSON (content-type=${ctype}): ${txt?.slice(0,200) || "no body"}`);
+            }
+            
             const json = (await resp.json()) as { transcript?: string };
+            
             const segText = (json.transcript || "").trim();
             if (segText) onText?.(segText);
             seqRef.current += 1;
@@ -252,10 +258,15 @@ export default function useVoiceCapture({
                   });
                   if (!resp.ok) {
                     const txt = await resp.text().catch(() => "");
-                    throw new Error(
-                      `STT ${resp.status} at ${API_BASE_URL}/api/transcribe-audio: ${txt || "not found"}`
-                    );
+                    throw new Error(`STT ${resp.status} at ${API_BASE_URL || "(relative)"}/api/transcribe-audio: ${txt || "no body"}`);
                   }
+                  
+                  const ctype = resp.headers.get("content-type") || "";
+                  if (!ctype.includes("application/json")) {
+                    const txt = await resp.text().catch(() => "");
+                    throw new Error(`STT response was not JSON (content-type=${ctype}): ${txt?.slice(0,200) || "no body"}`);
+                  }
+                  
                   const json = (await resp.json()) as { transcript?: string };
                   finalText = (json.transcript || "").trim();
 
