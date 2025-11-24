@@ -18,6 +18,30 @@ interface PaymentMethod {
   description: string;
 }
 
+type KioskFlow = "walkin" | "identify" | "lab" | "pharmacy";
+
+type StoredLabTest = {
+  id: string;
+  name: string;
+  price: number;
+};
+
+type StoredLabBooking = {
+  orderedTests?: StoredLabTest[];
+  additionalTests?: StoredLabTest[];
+  total?: number;
+  appointmentId?: string;
+  patientId?: string;
+  bookingId?: string;
+};
+
+type StoredPharmacyBill = {
+  billNumber: string;
+  total: number;
+  patientId: string;
+  hasDoctorVisit?: boolean;
+};
+
 declare global {
   interface Window {
     Razorpay?: any;
@@ -25,8 +49,15 @@ declare global {
 }
 
 // ---- Env & constants --------------------------------------------------------
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string || "").replace(/\/+$/, "");
+const runtimeOverride =
+  (window as any).__API_BASE_URL__ ||
+  new URLSearchParams(location.search).get("api") ||
+  localStorage.getItem("API_BASE_URL_OVERRIDE") ||
+  "";
+
+const API_BASE = (runtimeOverride || (import.meta as any)?.env?.VITE_API_BASE_URL || "").replace(/\/+$/, "");
 const RZP_JS = import.meta.env.VITE_RAZORPAY_CHECKOUT_URL || "https://checkout.razorpay.com/v1/checkout.js";
+const MICRO_TEST = (import.meta.env.VITE_RZP_MICRO_TEST === "true");
 
 // Small helper to safely load checkout.js once
 async function loadRazorpay(src: string) {
@@ -49,14 +80,14 @@ async function attachPaymentToAppointment({
   paymentId,
 }: {
   method: "upi" | "card" | string;
-  amount: number;        // rupees
+  amount: number; // rupees
   orderId: string;
   paymentId: string;
 }) {
   const patientId = sessionStorage.getItem("kioskPatientId") || "";
   const appointmentId = sessionStorage.getItem("kioskSelectedAppointmentId") || "";
 
-  if (!patientId || !appointmentId) return; // walk-in flow or missing context → skip
+  if (!patientId || !appointmentId) return;
 
   await fetch(`${API_BASE}/api/kiosk/appointments/attach`, {
     method: "POST",
@@ -70,7 +101,7 @@ async function attachPaymentToAppointment({
           provider: "razorpay",
           status: "success",
           method,
-          amount,                          // ₹ (display amount)
+          amount, // ₹ (display amount)
           orderId,
           paymentId,
           verified: true,
@@ -83,14 +114,13 @@ async function attachPaymentToAppointment({
   });
 }
 
-
 // ---- Component --------------------------------------------------------------
 export default function PaymentPage() {
   const navigate = useNavigate();
   const { t } = useTranslation(getStoredLanguage());
   const { toast } = useToast();
 
-  const flow = (sessionStorage.getItem("kioskFlow") || "identify") as "walkin" | "identify";
+  const flow = (sessionStorage.getItem("kioskFlow") || "identify") as KioskFlow;
 
   const [selectedMethod, setSelectedMethod] = useState<PaymentMethod["id"] | "">("");
   const [loading, setLoading] = useState(false);
@@ -124,24 +154,66 @@ export default function PaymentPage() {
     }
   }, [selectedServices, bill, flow]);
 
-  // We keep only ONE online option for Razorpay (all methods inside).
-  // To preserve types and existing handler, we call payWithRazorpay('upi').
+  // ---------- Lab booking (LAB flow) ----------
+  const labBooking: StoredLabBooking | null = useMemo(() => {
+    if (flow !== "lab") return null;
+    const raw = localStorage.getItem("medmitra-lab-booking");
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as StoredLabBooking;
+      return parsed || null;
+    } catch {
+      return null;
+    }
+  }, [flow]);
+
+  const labBill = useMemo(() => {
+    if (flow !== "lab" || !labBooking) return null;
+    const ordered = labBooking.orderedTests ?? [];
+    const additional = labBooking.additionalTests ?? [];
+    const orderedTotal = ordered.reduce((sum, t) => sum + (t.price || 0), 0);
+    const additionalTotal = additional.reduce((sum, t) => sum + (t.price || 0), 0);
+    const totalFromTests = orderedTotal + additionalTotal;
+    const total = typeof labBooking.total === "number" && labBooking.total > 0 ? labBooking.total : totalFromTests;
+    return {
+      ordered,
+      additional,
+      orderedTotal,
+      additionalTotal,
+      total,
+    };
+  }, [flow, labBooking]);
+
+  // ---------- Pharmacy bill (PHARMACY flow) ----------
+  const pharmacyBill: StoredPharmacyBill | null = useMemo(() => {
+    if (flow !== "pharmacy") return null;
+    const raw = localStorage.getItem("medmitra-pharmacy-bill");
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw) as StoredPharmacyBill;
+      if (!parsed || typeof parsed.total !== "number") return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }, [flow]);
+
+  // We keep only ONE online option for Razorpay (all methods available).
   const paymentMethods: PaymentMethod[] = [
     {
       id: "upi", // used only to trigger the same checkout; we are NOT forcing UPI
       name: "Pay Online (Razorpay)",
       icon: Smartphone,
-      description: "UPI, Card, Netbanking & Wallets"
+      description: "UPI, Card, Netbanking & Wallets",
     },
   ];
 
   const handleToggleService = (id: ServiceId) => {
-    setSelectedServices(prev => (prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]));
+    setSelectedServices((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   };
 
   // Pick/derive an invoice id for this flow
   const getInvoiceId = () => {
-    // Prefer unique, stable ids coming from your flow
     return (
       sessionStorage.getItem("kioskVisitId") ||
       sessionStorage.getItem("kioskSelectedAppointmentId") ||
@@ -149,11 +221,71 @@ export default function PaymentPage() {
     );
   };
 
+  // ---------- Identify-flow amount & breakdown ----------
+  const identifyPricing = useMemo(() => {
+    // Default total if we cannot infer anything from the appointment
+    let total = 605;
+
+    try {
+      const raw = sessionStorage.getItem("kioskSelectedAppointmentRaw");
+      if (raw) {
+        const appt = JSON.parse(raw);
+
+        // Prefer canonical amount from appointment.payment.amount if present
+        const paymentAmount = appt?.payment?.amount;
+        if (typeof paymentAmount === "number" && paymentAmount > 0) {
+          total = paymentAmount;
+        } else {
+          // Fallback: fee fields ("₹500", "500", etc.)
+          const feeStr =
+            (appt?.fee as string | undefined) || (appt?.appointment_details?.fee as string | undefined);
+          if (feeStr) {
+            const m = String(feeStr).match(/[\d.]+/);
+            if (m) {
+              const feeNum = Number(m[0]);
+              if (!Number.isNaN(feeNum) && feeNum > 0) {
+                const reg = 1;
+                const basePlusReg = feeNum + reg;
+                const gst = Math.round(basePlusReg * 0.1);
+                total = basePlusReg + gst;
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore parse errors, keep default 605
+    }
+
+    // Breakdown: consultation + registration + GST (10% of both)
+    const registrationFee = 1;
+    const basePlusReg = Math.round(total / 1.1); // approximate pre-tax amount
+    const consultationFee = Math.max(0, basePlusReg - registrationFee);
+    const gst = Math.max(0, total - consultationFee - registrationFee);
+
+    return {
+      total,
+      consultationFee,
+      registrationFee,
+      gst,
+    };
+  }, []);
+
   // Amount (in rupees) rendered on UI; convert to paise for Razorpay Order
-  const uiAmount = useMemo(() => (flow === "walkin" ? bill.total : 605), [flow, bill]);
+  const uiAmount = useMemo(() => {
+    const real =
+      flow === "walkin"
+        ? bill.total
+        : flow === "lab"
+        ? labBill?.total ?? 0
+        : flow === "pharmacy"
+        ? pharmacyBill?.total ?? 0
+        : identifyPricing.total;
+    return MICRO_TEST ? 1 : real; // force ₹1 when micro-test is ON
+  }, [flow, bill.total, identifyPricing.total, labBill?.total, pharmacyBill?.total]);
 
   const payWithRazorpay = async (method: PaymentMethod["id"]) => {
-    if (openingRef.current) return;            // prevent double invokes
+    if (openingRef.current) return; // prevent double invokes
     openingRef.current = true;
 
     setSelectedMethod(method);
@@ -161,113 +293,210 @@ export default function PaymentPage() {
     setLoading(true);
 
     try {
-      // 1) Compute amount in paise (integer)
+      const patientId =
+        sessionStorage.getItem("kioskPatientId") ||
+        pharmacyBill?.patientId ||
+        "";
+
+      const appointmentId =
+        flow === "pharmacy"
+          ? ""
+          : sessionStorage.getItem("kioskSelectedAppointmentId") ||
+            (labBooking?.appointmentId || "");
+
+      if (!patientId) {
+        throw new Error("Session expired. Please verify your phone again.");
+      }
+      if (flow !== "pharmacy" && !appointmentId) {
+        throw new Error("Missing appointment context. Please book a slot again.");
+      }
+
       const amountPaise = Math.round(uiAmount * 100);
       if (amountPaise <= 0) throw new Error("Invalid amount");
 
-      // 2) Create (or reuse) an Order for our invoice
-      const invoiceId = getInvoiceId();
-      const createRes = await fetch(`${API_BASE}/api/billing/razorpay/order`, {
+      const invoiceId =
+        flow === "pharmacy"
+          ? (pharmacyBill?.billNumber || `PHARM-${Date.now()}`)
+          : getInvoiceId();
+
+      await loadRazorpay(RZP_JS);
+      if (!window.Razorpay) throw new Error("Razorpay SDK not available");
+
+      const orderUrl =
+        flow === "pharmacy"
+          ? `${API_BASE}/api/billing/razorpay/pharmacy/order`
+          : `${API_BASE}/api/billing/razorpay/order`;
+
+      const createRes = await fetch(orderUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(flow === "pharmacy" ? {} : { "X-Patient-Id": patientId }),
+        },
         credentials: "include",
-        body: JSON.stringify({
-          invoice_id: invoiceId,
-          amount: amountPaise,
-          notes: {
-            flow,
-            patientId: sessionStorage.getItem("kioskPatientId") || "",
-          },
-          customer: {
-            name: "",                                        // optional
-            email: "",                                       // optional
-            contact: sessionStorage.getItem("kioskPhone") || ""
-          }
-        }),
+        body: JSON.stringify(
+          flow === "pharmacy"
+            ? {
+                patientId,
+                invoice_id: invoiceId,
+                amount: amountPaise,
+                currency: "INR",
+                notes: { flow, patientId },
+                customer: {
+                  name: "",
+                  email: "",
+                  contact: sessionStorage.getItem("kioskPhone") || "",
+                },
+              }
+            : {
+                patientId,
+                appointmentId,
+                invoice_id: invoiceId,
+                amount: amountPaise,
+                currency: "INR",
+                notes: { flow, patientId, appointmentId },
+                customer: {
+                  name: "",
+                  email: "",
+                  contact: sessionStorage.getItem("kioskPhone") || "",
+                },
+              }
+        ),
       });
+
       if (!createRes.ok) {
         const txt = await createRes.text().catch(() => "");
         throw new Error(`Order create failed (${createRes.status}): ${txt || "unknown"}`);
       }
       const { key_id, order_id, currency } = await createRes.json();
 
-      // 3) Load checkout.js
-      await loadRazorpay(RZP_JS);
-      if (!window.Razorpay) throw new Error("Razorpay SDK not available");
-
-      // 4) Open Razorpay Checkout (we do not force a method, so all options show)
       const rzp = new window.Razorpay({
         key: key_id,
         order_id,
         amount: amountPaise,
         currency: currency || "INR",
         name: "MedMitra AI",
-        description: flow === "walkin" ? "Walk-in visit payment" : "Consultation payment",
+        description:
+          flow === "walkin"
+            ? "Walk-in visit payment"
+            : flow === "lab"
+            ? "Lab tests payment"
+            : flow === "pharmacy"
+            ? "Pharmacy payment"
+            : "Consultation payment",
         prefill: { contact: sessionStorage.getItem("kioskPhone") || "" },
         notes: { invoice_id: invoiceId },
-        // Success handler (client-side) — must verify on server next
+
         handler: async (resp: any) => {
           try {
-            const verifyRes = await fetch(`${API_BASE}/api/billing/razorpay/verify`, {
+            const verifyUrl =
+              flow === "pharmacy"
+                ? `${API_BASE}/api/billing/razorpay/pharmacy/verify`
+                : `${API_BASE}/api/billing/razorpay/verify`;
+
+            const verifyRes = await fetch(verifyUrl, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+                ...(flow === "pharmacy" ? {} : { "X-Patient-Id": patientId }),
+              },
               credentials: "include",
-              body: JSON.stringify({
-                invoice_id: invoiceId,
-                razorpay_payment_id: resp.razorpay_payment_id,
-                razorpay_order_id: resp.razorpay_order_id,
-                razorpay_signature: resp.razorpay_signature
-              }),
+              body: JSON.stringify(
+                flow === "pharmacy"
+                  ? {
+                      patientId,
+                      invoice_id: invoiceId,
+                      razorpay_payment_id: resp.razorpay_payment_id,
+                      razorpay_order_id: resp.razorpay_order_id,
+                      razorpay_signature: resp.razorpay_signature,
+                    }
+                  : {
+                      patientId,
+                      appointmentId,
+                      invoice_id: invoiceId,
+                      razorpay_payment_id: resp.razorpay_payment_id,
+                      razorpay_order_id: resp.razorpay_order_id,
+                      razorpay_signature: resp.razorpay_signature,
+                    }
+              ),
             });
+
             if (!verifyRes.ok) throw new Error("Signature verification failed");
 
             setPaymentStatus("success");
             setTransactionId(resp.razorpay_payment_id || "");
 
-            // Save for TokenPage/printing
-            sessionStorage.setItem("lastPayment", JSON.stringify({
-              flow,
-              method,
-              amount: uiAmount,
-              transactionId: resp.razorpay_payment_id || "",
-              at: new Date().toISOString(),
-              bill
-            }));
+            sessionStorage.setItem(
+              "lastPayment",
+              JSON.stringify({
+                flow,
+                method,
+                amount: uiAmount,
+                transactionId: resp.razorpay_payment_id || "",
+                at: new Date().toISOString(),
+                bill,
+                labBill,
+                pharmacyBill,
+              })
+            );
 
-            await attachPaymentToAppointment({
-              method,
-              amount: uiAmount,
-              orderId: resp.razorpay_order_id,
-              paymentId: resp.razorpay_payment_id,
-            });
+            // For pharmacy we don't attach to appointment
+            if (flow !== "pharmacy") {
+              await attachPaymentToAppointment({
+                method,
+                amount: uiAmount,
+                orderId: resp.razorpay_order_id,
+                paymentId: resp.razorpay_payment_id,
+              });
+            }
 
-            // Handoff to token page shortly
             setTimeout(() => navigate("/token"), 1200);
           } catch (e: any) {
             setPaymentStatus("failed");
-            toast({ variant: "destructive", title: "Verification Failed", description: e?.message || "Please try again." });
+            toast({
+              variant: "destructive",
+              title: "Verification Failed",
+              description: e?.message || "Please try again.",
+            });
           } finally {
             setLoading(false);
             openingRef.current = false;
           }
         },
+
         modal: {
           ondismiss: () => {
-            // user closed the modal — reset UI to allow retry
             setPaymentStatus("pending");
             setSelectedMethod("");
             setLoading(false);
             openingRef.current = false;
-          }
+          },
         },
-        theme: { color: "#1E293B" } // optional brand color (matches your UI vibe)
+
+        theme: { color: "#1E293B" },
+      });
+
+      rzp.on("payment.failed", (resp: any) => {
+        setPaymentStatus("failed");
+        setSelectedMethod("");
+        setLoading(false);
+        openingRef.current = false;
+        toast({
+          variant: "destructive",
+          title: "Payment Failed",
+          description: resp?.error?.description || "Payment was not completed.",
+        });
       });
 
       rzp.open();
     } catch (err: any) {
       console.error(err);
       setPaymentStatus("failed");
-      toast({ variant: "destructive", title: "Payment Error", description: err?.message || "Could not start payment" });
+      toast({
+        variant: "destructive",
+        title: "Payment Error",
+        description: err?.message || "Could not start payment",
+      });
       setLoading(false);
       openingRef.current = false;
     }
@@ -279,14 +508,53 @@ export default function PaymentPage() {
     setTransactionId("");
   };
 
-  const handleSkip = () => {
-    // Allowed mostly for Identify flow where payment may be pre-paid or handled at desk
-    navigate("/token");
+  // NEW: record pay-later cash in DB and DO NOT issue token on kiosk
+  const handleSkip = async () => {
+    try {
+      setLoading(true);
+      const patientId =
+        sessionStorage.getItem("kioskPatientId") ||
+        pharmacyBill?.patientId ||
+        "";
+      const appointmentId =
+        flow === "pharmacy"
+          ? ""
+          : sessionStorage.getItem("kioskSelectedAppointmentId") ||
+            (labBooking?.appointmentId || "");
+
+      if (patientId && appointmentId && flow !== "pharmacy") {
+        await fetch(`${API_BASE}/api/kiosk/appointments/attach`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            patientId,
+            appointmentId,
+            kiosk: {
+              payment: {
+                mode: "pay_later",
+                status: "unpaid",
+                channel: "front-desk",
+                amount: uiAmount,
+                notedAt: new Date().toISOString(),
+              },
+            },
+          }),
+        }).catch(() => {});
+      }
+    } finally {
+      setLoading(false);
+      // No token generation here; front desk will handle cash & token
+      navigate("/cash-pending");
+    }
   };
 
   const handlePrintReceipt = async () => {
     if (transactionId) {
-      toast({ title: "Receipt Printing", description: "Your receipt will be printed at the front desk." });
+      toast({
+        title: "Receipt Printing",
+        description: "Your receipt will be printed at the front desk.",
+      });
     }
   };
 
@@ -311,7 +579,9 @@ export default function PaymentPage() {
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-muted-foreground">Transaction ID</span>
-                <Badge variant="outline" className="font-mono">{transactionId}</Badge>
+                <Badge variant="outline" className="font-mono">
+                  {transactionId}
+                </Badge>
               </div>
               <div className="flex justify-between items-center">
                 <span className="text-muted-foreground">Payment Method</span>
@@ -328,7 +598,9 @@ export default function PaymentPage() {
             <Button onClick={handlePrintReceipt} variant="outline" size="lg" className="flex-1 text-lg py-4 h-auto">
               <Receipt className="h-5 w-5 mr-2" /> Print Receipt
             </Button>
-            <Button onClick={() => navigate("/token")} size="lg" className="flex-1 text-lg py-4 h-auto"> Continue </Button>
+            <Button onClick={() => navigate("/token")} size="lg" className="flex-1 text-lg py-4 h-auto">
+              Continue
+            </Button>
           </div>
 
           <Card className="mt-6 p-4 bg-muted/30 border-0">
@@ -354,8 +626,17 @@ export default function PaymentPage() {
               We couldn't process your payment. Please try again or contact our front desk for assistance.
             </p>
             <div className="flex gap-4">
-              <Button onClick={handleRetry} size="lg" className="flex-1 text-xl py-6 h-auto">Try Again</Button>
-              <Button onClick={() => navigate("/help")} variant="outline" size="lg" className="flex-1 text-lg py-4 h-auto">Get Help</Button>
+              <Button onClick={handleRetry} size="lg" className="flex-1 text-xl py-6 h-auto">
+                Try Again
+              </Button>
+              <Button
+                onClick={() => navigate("/help")}
+                variant="outline"
+                size="lg"
+                className="flex-1 text-lg py-4 h-auto"
+              >
+                Get Help
+              </Button>
             </div>
           </div>
         </div>
@@ -364,11 +645,6 @@ export default function PaymentPage() {
   }
 
   // ---------- Main Payment page ----------
-  const payDisabled = (m: PaymentMethod) =>
-    loading || (flow === "walkin" && selectedServices.length === 0);
-
-  const cashDisabled = loading || (flow === "walkin" && selectedServices.length === 0);
-
   return (
     <KioskLayout title="Payment">
       <div className="max-w-3xl mx-auto">
@@ -377,7 +653,13 @@ export default function PaymentPage() {
           <IndianRupee className="h-16 w-16 text-primary mx-auto mb-4" />
           <h1 className="text-3xl font-bold text-primary mb-4">Payment Summary</h1>
           <p className="text-lg text-muted-foreground">
-            {flow === "walkin" ? "Please select your services and complete the payment" : "Please review your charges and complete the payment"}
+            {flow === "walkin"
+              ? "Please select your services and complete the payment"
+              : flow === "lab"
+              ? "Please review your lab charges and complete the payment"
+              : flow === "pharmacy"
+              ? "Please review your pharmacy charges and complete the payment"
+              : "Please review your charges and complete the payment"}
           </p>
         </div>
 
@@ -388,10 +670,9 @@ export default function PaymentPage() {
 
             {flow === "walkin" ? (
               <>
-                {/* Selected services list */}
                 <div className="space-y-2 mb-3">
-                  {selectedServices.map(sid => {
-                    const svc = SERVICE_CATALOG.find(s => s.id === sid);
+                  {selectedServices.map((sid) => {
+                    const svc = SERVICE_CATALOG.find((s) => s.id === sid);
                     return (
                       <div key={sid} className="flex justify-between">
                         <span className="text-muted-foreground">{svc?.name}</span>
@@ -401,7 +682,6 @@ export default function PaymentPage() {
                   })}
                 </div>
 
-                {/* Registration fee (auto) */}
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Registration Fee</span>
                   <span>₹{bill.registrationFee}</span>
@@ -422,13 +702,100 @@ export default function PaymentPage() {
                   <span className="text-primary">₹{bill.total}</span>
                 </div>
               </>
+            ) : flow === "lab" ? (
+              <div className="space-y-3">
+                {labBill && (
+                  <>
+                    {labBill.ordered.length > 0 && (
+                      <>
+                        <p className="text-sm font-medium text-muted-foreground mb-1">Doctor-Ordered Tests</p>
+                        <div className="space-y-1 mb-2">
+                          {labBill.ordered.map((t) => (
+                            <div key={t.id} className="flex justify-between text-sm">
+                              <span className="text-muted-foreground">{t.name}</span>
+                              <span>₹{t.price}</span>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="flex justify-between mb-3">
+                          <span className="text-xs text-muted-foreground">Subtotal (Ordered)</span>
+                          <span className="text-xs">₹{labBill.orderedTotal}</span>
+                        </div>
+                        <Separator className="my-2" />
+                      </>
+                    )}
+
+                    {labBill.additional.length > 0 && (
+                      <>
+                        <p className="text-sm font-medium text-muted-foreground mb-1">Additional Tests</p>
+                        <div className="space-y-1 mb-2">
+                          {labBill.additional.map((t) => (
+                            <div key={t.id} className="flex justify-between text-sm">
+                              <span className="text-muted-foreground">{t.name}</span>
+                              <span>₹{t.price}</span>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="flex justify-between mb-3">
+                          <span className="text-xs text-muted-foreground">Subtotal (Additional)</span>
+                          <span className="text-xs">₹{labBill.additionalTotal}</span>
+                        </div>
+                        <Separator className="my-2" />
+                      </>
+                    )}
+
+                    <div className="flex justify-between text-lg font-semibold">
+                      <span>Total Amount</span>
+                      <span className="text-primary">₹{labBill.total}</span>
+                    </div>
+                  </>
+                )}
+
+                {!labBill && (
+                  <p className="text-sm text-muted-foreground">
+                    No lab booking details found. Please go back and select your tests again.
+                  </p>
+                )}
+              </div>
+            ) : flow === "pharmacy" ? (
+              <div className="space-y-3">
+                {pharmacyBill ? (
+                  <>
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">Bill Number</span>
+                      <span className="font-mono">{pharmacyBill.billNumber}</span>
+                    </div>
+                    <Separator className="my-3" />
+                    <div className="flex justify-between text-lg font-semibold">
+                      <span>Total Amount</span>
+                      <span className="text-primary">₹{pharmacyBill.total}</span>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    No pharmacy bill found. Please go back and fetch the bill again.
+                  </p>
+                )}
+              </div>
             ) : (
               <div className="space-y-3">
-                <div className="flex justify-between"><span className="text-muted-foreground">Consultation Fee</span><span>₹500</span></div>
-                <div className="flex justify-between"><span className="text-muted-foreground">Registration Fee</span><span>₹50</span></div>
-                <div className="flex justify-between"><span className="text-muted-foreground">GST (10%)</span><span>₹55</span></div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Consultation Fee</span>
+                  <span>₹{identifyPricing.consultationFee}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">Registration Fee</span>
+                  <span>₹{identifyPricing.registrationFee}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">GST (10%)</span>
+                  <span>₹{identifyPricing.gst}</span>
+                </div>
                 <Separator />
-                <div className="flex justify-between text-lg font-semibold"><span>Total Amount</span><span className="text-primary">₹605</span></div>
+                <div className="flex justify-between text-lg font-semibold">
+                  <span>Total Amount</span>
+                  <span className="text-primary">₹{identifyPricing.total}</span>
+                </div>
               </div>
             )}
           </Card>
@@ -436,19 +803,26 @@ export default function PaymentPage() {
           {/* Payment Methods / Service Picker */}
           <Card className="p-6">
             <h2 className="text-xl font-semibold mb-4">
-              {flow === "walkin" ? "Choose How You Want to Pay" : "Choose How You Want to Pay"}
+              {flow === "walkin"
+                ? "Choose How You Want to Pay"
+                : "Choose How You Want to Pay"}
             </h2>
 
             {flow === "walkin" && (
               <div className="mb-6 space-y-3">
-                {SERVICE_CATALOG.filter(s => s.selectable).map(svc => (
-                  <label key={svc.id} className="flex items-center justify-between border rounded-md px-4 py-3 cursor-pointer">
+                {SERVICE_CATALOG.filter((s) => s.selectable).map((svc) => (
+                  <label
+                    key={svc.id}
+                    className="flex items-center justify-between border rounded-md px-4 py-3 cursor-pointer"
+                  >
                     <div>
-                      <div className="font-medium">{svc.name}</div>
-                      {svc.description && <div className="text-sm text-muted-foreground">{svc.description}</div>}
+                      <div className="font-medium">{svc?.name}</div>
+                      {svc?.description && (
+                        <div className="text-sm text-muted-foreground">{svc.description}</div>
+                      )}
                     </div>
                     <div className="flex items-center gap-4">
-                      <span className="text-sm text-muted-foreground">₹{svc.price}</span>
+                      <span className="text-sm text-muted-foreground">₹{svc?.price}</span>
                       <input
                         type="checkbox"
                         className="h-5 w-5"
@@ -465,7 +839,6 @@ export default function PaymentPage() {
               </div>
             )}
 
-            {/* Payment method / processing */}
             {paymentStatus === "processing" ? (
               <div className="text-center py-8">
                 <div className="bg-primary/10 rounded-full w-16 h-16 flex items-center justify-center mx-auto mb-4">
@@ -478,8 +851,7 @@ export default function PaymentPage() {
               </div>
             ) : (
               <div className="space-y-4">
-                {/* Online via Razorpay (all methods available) */}
-                {paymentMethods.map(method => {
+                {paymentMethods.map((method) => {
                   const IconComponent = method.icon;
                   return (
                     <Button
@@ -487,7 +859,12 @@ export default function PaymentPage() {
                       variant="outline"
                       className="w-full h-auto p-4 flex items-center gap-4 hover:shadow-card transition-all disabled:opacity-60"
                       onClick={() => payWithRazorpay(method.id)}
-                      disabled={payDisabled(method)}
+                      disabled={
+                        loading ||
+                        (flow === "walkin" && selectedServices.length === 0) ||
+                        (flow === "lab" && (!labBill || labBill.total <= 0)) ||
+                        (flow === "pharmacy" && (!pharmacyBill || pharmacyBill.total <= 0))
+                      }
                     >
                       <div className="bg-primary/10 rounded-full p-2">
                         <IconComponent className="h-6 w-6 text-primary" />
@@ -505,14 +882,21 @@ export default function PaymentPage() {
                   variant="outline"
                   className="w-full h-auto p-4 flex items-center gap-4 hover:shadow-card transition-all disabled:opacity-60"
                   onClick={handleSkip}
-                  disabled={cashDisabled}
+                  disabled={
+                    loading ||
+                    (flow === "walkin" && selectedServices.length === 0) ||
+                    (flow === "lab" && (!labBill || labBill.total <= 0)) ||
+                    (flow === "pharmacy" && (!pharmacyBill || pharmacyBill.total <= 0))
+                  }
                 >
                   <div className="bg-primary/10 rounded-full p-2">
                     <IndianRupee className="h-6 w-6 text-primary" />
                   </div>
                   <div className="flex-1 text-left">
-                    <h3 className="font-medium">Pay at Reception (Cash)</h3>
-                    <p className="text-sm text-muted-foreground">Pay in cash at the front desk and get your token</p>
+                    <h3 className="text-sm font-medium md:text-base">Pay at Reception (Cash)</h3>
+                    <p className="text-xs md:text-sm text-muted-foreground">
+                      Pay in cash at the front desk and get your token
+                    </p>
                   </div>
                 </Button>
               </div>
@@ -520,12 +904,14 @@ export default function PaymentPage() {
           </Card>
         </div>
 
-        {/* Skip (mostly Identify) */}
+        {/* Skip (mostly Identify / Lab portal already paid at desk) */}
         <Card className="mt-6 p-4 bg-muted/30 border-0">
           <div className="flex items-center justify-between">
             <div>
               <p className="font-medium">Already paid?</p>
-              <p className="text-sm text-muted-foreground">Skip payment if you've already settled the bill at the front desk</p>
+              <p className="text-sm text-muted-foreground">
+                Skip payment if you've already settled the bill at the front desk
+              </p>
             </div>
             <Button onClick={handleSkip} variant="outline" disabled={loading}>
               Skip Payment

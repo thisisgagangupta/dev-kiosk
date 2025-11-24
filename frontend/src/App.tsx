@@ -13,6 +13,7 @@ import WalkinPage from "./pages/WalkinPage";
 import ReasonPage from "./pages/ReasonPage";
 import PaymentPage from "./pages/PaymentPage";
 import DiagnosticsPage from "./pages/DiagnosticsPage";
+import DiagnosticsBookingPage from "./pages/DiagnosticsBookingPage";
 import TokenPage from "./pages/TokenPage";
 import QueuePage from "./pages/QueuePage";
 import LabPage from "./pages/LabPage";
@@ -23,6 +24,8 @@ import StaffPage from "./pages/StaffPage";
 import SettingsPage from "./pages/SettingsPage";
 import NotFound from "./pages/NotFound";
 import WalkinSlotPage from "@/pages/WalkinSlotPage";
+import CashPendingPage from "./pages/CashPendingPage";
+import FrontDeskCashPage from "./pages/FrontDeskCashPage";
 
 const queryClient = new QueryClient();
 
@@ -43,6 +46,7 @@ const App = () => (
           <Route path="/reason" element={<ReasonPage />} />
           {/* <Route path="/pay" element={<PaymentPage />} /> */}
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
+          <Route path="/diagnostics-booking" element={<DiagnosticsBookingPage />} />
           <Route path="/payment" element={<PaymentPage />} />
           <Route path="/token" element={<TokenPage />} />
           <Route path="/queue" element={<QueuePage />} />
@@ -53,6 +57,8 @@ const App = () => (
           <Route path="/staff" element={<StaffPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/walkin-slot" element={<WalkinSlotPage />} />
+          <Route path="/cash-pending" element={<CashPendingPage />} />
+          <Route path="/frontdeskcash" element={<FrontDeskCashPage />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </BrowserRouter>

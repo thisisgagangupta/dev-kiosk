@@ -61,6 +61,8 @@ export const translations: Record<Language, Translations> = {
       continue: "Continue",
       assistance: "Need assistance? Our friendly staff at the front desk are happy to help you get started."
     },
+    // ✅ NEW: used by LabPage / KioskLayout
+    lab_services_title: "Laboratory Services",
     // Add more translations as needed...
   },
   hi: {
@@ -90,6 +92,8 @@ export const translations: Record<Language, Translations> = {
       continue: "आगे बढ़ें",
       assistance: "सहायता चाहिए? फ्रंट डेस्क पर हमारा स्टाफ आपकी मदद करने के लिए तैयार है।"
     },
+    // ✅ NEW: Hindi version for the same key
+    lab_services_title: "प्रयोगशाला सेवाएँ",
     // Add Hindi translations...
   },
 };
@@ -99,14 +103,14 @@ export const useTranslation = (language: Language = 'en') => {
   const t = (key: string, defaultText?: string): string => {
     const keys = key.split('.');
     let value: any = translations[language];
-    
+
     for (const k of keys) {
       value = value?.[k];
     }
-    
+
     return typeof value === 'string' ? value : (defaultText || key);
   };
-  
+
   return { t };
 };
 
@@ -118,7 +122,6 @@ export const getStoredLanguage = (): Language => {
   }
   return 'en'; // default
 };
-
 
 export const setStoredLanguage = (language: Language): void => {
   localStorage.setItem('medmitra-language', language);

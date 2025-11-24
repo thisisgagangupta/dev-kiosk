@@ -80,12 +80,20 @@ def _mount(router_import_path: str, prefix: str, human: str):
 _mount("app.kiosk.walkins:router", "/api", "kiosk walkins")
 _mount("app.kiosk.identify:router", "/api", "kiosk identify")
 _mount("app.kiosk.session:router", "/api", "kiosk session")
+_mount("app.queue.router:router", "/api", "queue & tokens")
 
 # appointments
-_mount("app.appointments.router:router", "/api", "appointments core")
 _mount("app.appointments.availability:router", "/api", "appointments availability")
 _mount("app.appointments.book:router", "/api", "appointments booking")
+_mount("app.appointments.book_batch:router", "/api", "appointments batch booking")  
 _mount("app.appointments.kiosk_attach:router", "/api", "appointments kiosk attach")
+_mount("app.appointments.router:router", "/api", "appointments core")  
+_mount("app.appointments.frontdesk_cash:router", "/api", "frontdesk cash")
+# lab
+_mount("app.lab.router:router", "/api", "lab bookings")
+_mount("app.pharmacy.router:router", "/api", "pharmacy bills")
+_mount("app.diagnostics.router:router", "/api", "diagnostics partner")
+
 
 # voice + billing
 _mount("app.voice.router:router", "/api", "voice")

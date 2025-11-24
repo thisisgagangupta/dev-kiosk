@@ -9,6 +9,11 @@ class WalkinRegisterRequest(BaseModel):
     hasCaregiver: bool = False
     countryCode: Optional[str] = Field(default="+91", max_length=6)
 
+    # NEW: optional OTP fields for walk-in verification
+    otpCode: Optional[str] = None
+    otpSessionId: Optional[str] = None
+
+
 class WalkinRegisterResponse(BaseModel):
     patientId: str
     created: bool

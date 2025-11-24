@@ -1,7 +1,8 @@
 import os
 import re
 import logging
-from typing import List, Optional, Dict, Any
+import json
+from typing import List, Optional, Dict, Any, Tuple
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -14,26 +15,40 @@ router = APIRouter(prefix="/appointments", tags=["appointments"])
 AWS_REGION = os.getenv("AWS_REGION", "us-west-2")
 
 # DynamoDB Appointments table (same name your patient portal writes to)
-DDB_TABLE_APPOINTMENTS = os.getenv("DDB_TABLE_APPOINTMENTS", "medmitra_appointments")
+DDB_TABLE_APPOINTMENTS = os.getenv("DDB_TABLE_APPOINTMENTS", "medmitra-appointments")
+# Patients table (for walk-in + profile seeding)
+DDB_TABLE_PATIENTS = os.getenv("DDB_TABLE_PATIENTS", "medmitra_patients")
 
 # Optional local DynamoDB endpoint for dev
 DYNAMODB_ENDPOINT = (os.getenv("DYNAMODB_LOCAL_URL") or "").strip() or None
 
-# Cognito (to resolve phone -> user sub/patientId)
+# Cognito (to resolve phone -> user sub/patientId and names)
 COGNITO_USER_POOL_ID = (os.getenv("COGNITO_USER_POOL_ID") or "").strip()
 if not COGNITO_USER_POOL_ID:
     raise RuntimeError("Missing COGNITO_USER_POOL_ID")
 cognito = boto3.client("cognito-idp", region_name=AWS_REGION)
 
-def _ddb_table():
+
+def _ddb_resource():
     kw = {"region_name": AWS_REGION}
     if DYNAMODB_ENDPOINT:
         kw["endpoint_url"] = DYNAMODB_ENDPOINT
-    ddb = boto3.resource("dynamodb", **kw)
+    return boto3.resource("dynamodb", **kw)
+
+
+def _ddb_table():
+    ddb = _ddb_resource()
     return ddb.Table(DDB_TABLE_APPOINTMENTS)
+
+
+def _patients_table():
+    ddb = _ddb_resource()
+    return ddb.Table(DDB_TABLE_PATIENTS)
+
 
 def _coerce_str(v: Optional[str]) -> str:
     return (v or "").strip()
+
 
 def _normalize_phone(mobile: str, country_code: str = "+91") -> str:
     # mirrors kiosk identify normalization (kept local to avoid import cycles)
@@ -51,7 +66,31 @@ def _normalize_phone(mobile: str, country_code: str = "+91") -> str:
             return f"+{digits}"
     return f"+{str(country_code).strip('+')}{digits}"
 
-def _cognito_sub_from_phone(e164: str) -> Optional[str]:
+
+def _best_name_from_attrs(attrs: Dict[str, Any]) -> str:
+    """Pick the nicest human name we can from Cognito attributes."""
+    gn = (attrs.get("given_name") or "").strip()
+    fn = (attrs.get("family_name") or "").strip()
+    if gn or fn:
+        return f"{gn} {fn}".strip()
+
+    nm = (attrs.get("name") or "").strip()
+    if nm:
+        return nm
+
+    email = (attrs.get("email") or "").strip()
+    if email:
+        handle = email.split("@")[0]
+        return handle.replace(".", " ").replace("_", " ").title()
+
+    return ""
+
+
+def _cognito_identity_from_phone(e164: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return (patientId, patientName) for a phone number using Cognito.
+    patientId is the 'sub' (or Username fallback); patientName is best-effort.
+    """
     try:
         # exact match first
         resp = cognito.list_users(
@@ -73,23 +112,102 @@ def _cognito_sub_from_phone(e164: str) -> Optional[str]:
             except ClientError:
                 users = []
         if not users:
-            return None
+            return None, None
         user = users[0]
-        # pull "sub" from attributes
         attrs = {a["Name"]: a["Value"] for a in user.get("Attributes", [])}
-        return attrs.get("sub") or user.get("Username")
+        sub = attrs.get("sub") or user.get("Username")
+        return sub, _best_name_from_attrs(attrs)
     except ClientError as e:
         msg = e.response["Error"].get("Message", str(e))
         log.exception("Cognito list_users failed: %s", msg)
         raise HTTPException(status_code=500, detail=f"Cognito error: {msg}")
 
+
+def _cognito_name_from_sub(sub: str) -> Optional[str]:
+    """
+    Best-effort: resolve a patient's name from Cognito using sub.
+    """
+    try:
+        resp = cognito.list_users(
+            UserPoolId=COGNITO_USER_POOL_ID,
+            Filter=f'sub = "{sub}"',
+            Limit=1,
+        )
+        users = resp.get("Users", []) or []
+        if not users:
+            return None
+        attrs = {a["Name"]: a["Value"] for a in users[0].get("Attributes", [])}
+        return _best_name_from_attrs(attrs) or None
+    except ClientError as e:
+        msg = e.response["Error"].get("Message", str(e))
+        log.warning("Cognito list_users by sub failed: %s", msg)
+        return None
+    except Exception:
+        log.exception("Cognito list_users by sub unexpected error")
+        return None
+
+
+def _patient_display_name_from_id(patient_id: str) -> Optional[str]:
+    """
+    Try to resolve a human-readable patient name:
+    1) medmitra_patients table (walk-in flow)
+    2) Cognito attributes (given_name/family_name/name/email)
+    """
+    # 1) medmitra_patients
+    try:
+        tbl = _patients_table()
+        resp = tbl.get_item(Key={"patientId": patient_id})
+        item = resp.get("Item")
+        if item:
+            full = (item.get("fullName") or "").strip()
+            if full:
+                return full
+            first = (item.get("firstName") or "").strip()
+            last = (item.get("lastName") or "").strip()
+            if first or last:
+                return f"{first} {last}".strip()
+    except Exception:
+        # soft-fail; don't break the endpoint if patients table is missing
+        log.debug("patients_table lookup failed for %s", patient_id, exc_info=True)
+
+    # 2) Cognito
+    if not COGNITO_USER_POOL_ID:
+        return None
+    return _cognito_name_from_sub(patient_id)
+
+
+def _get_appointment_details(it: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Safely return appointment_details as a dict, regardless of whether it's stored
+    as a Map (dict) or as a JSON string (book-batch writer).
+    """
+    raw = it.get("appointment_details")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def _normalize_item(it: Dict[str, Any]) -> Dict[str, Any]:
     # Decide kind and flatten common display fields (supports both FastAPI+Lambda writers)
+    details = _get_appointment_details(it)
+
     kind = it.get("recordType") or (
         "lab" if it.get("tests")
-        else "doctor" if (it.get("doctorId") or it.get("doctorName") or (it.get("appointment_details") and (it["appointment_details"].get("doctorId") or it["appointment_details"].get("doctorName"))))
+        else "doctor"
+        if (
+            it.get("doctorId")
+            or it.get("doctorName")
+            or (details and (details.get("doctorId") or details.get("doctorName")))
+        )
         else "appointment"
     )
+
     return {
         "appointmentId": it.get("appointmentId"),
         "patientId": it.get("patientId"),
@@ -97,24 +215,37 @@ def _normalize_item(it: Dict[str, Any]) -> Dict[str, Any]:
         "status": it.get("status", it.get("payment", {}).get("status", "BOOKED")),
 
         "recordType": kind,
-        "clinicName": _coerce_str(it.get("clinicName") or it.get("appointment_details", {}).get("clinicName")),
+        "clinicName": _coerce_str(it.get("clinicName") or details.get("clinicName")),
         "clinicAddress": _coerce_str(it.get("clinicAddress")),
-        "doctorId": _coerce_str(it.get("doctorId") or it.get("appointment_details", {}).get("doctorId")),
-        "doctorName": _coerce_str(it.get("doctorName") or it.get("appointment_details", {}).get("doctorName")),
-        "specialty": _coerce_str(it.get("specialty") or it.get("appointment_details", {}).get("specialty")),
-        "consultationType": _coerce_str(it.get("consultationType") or it.get("appointment_details", {}).get("consultationType")),
-        "appointmentType": _coerce_str(it.get("appointmentType") or it.get("appointment_details", {}).get("appointmentType")),
-        "dateISO": _coerce_str(it.get("dateISO") or it.get("appointment_details", {}).get("dateISO") or it.get("collection", {}).get("preferredDateISO")),
-        "timeSlot": _coerce_str(it.get("timeSlot") or it.get("appointment_details", {}).get("timeSlot") or it.get("collection", {}).get("preferredSlot")),
-        "fee": _coerce_str(it.get("fee") or it.get("appointment_details", {}).get("fee")),
+        "doctorId": _coerce_str(it.get("doctorId") or details.get("doctorId")),
+        "doctorName": _coerce_str(it.get("doctorName") or details.get("doctorName")),
+        "specialty": _coerce_str(it.get("specialty") or details.get("specialty")),
+        "consultationType": _coerce_str(it.get("consultationType") or details.get("consultationType")),
+        "appointmentType": _coerce_str(it.get("appointmentType") or details.get("appointmentType")),
+        "dateISO": _coerce_str(
+            it.get("dateISO")
+            or details.get("dateISO")
+            or it.get("collection", {}).get("preferredDateISO")
+        ),
+        "timeSlot": _coerce_str(
+            it.get("timeSlot")
+            or details.get("timeSlot")
+            or it.get("collection", {}).get("preferredSlot")
+        ),
+        "fee": _coerce_str(it.get("fee") or details.get("fee")),
         "s3Key": it.get("s3Key"),
+
+        # group bookings from book_batch.py
+        "groupId": it.get("groupId"),
+        "groupSize": it.get("groupSize"),
 
         "tests": it.get("tests") or [],
         "collection": it.get("collection"),
-        "appointment_details": it.get("appointment_details"),
+        "appointment_details": details if details else None,
         "payment": it.get("payment"),
         "_raw": it,
     }
+
 
 def _query_appointments(patient_id: str, limit: int, start_key: Optional[Dict[str, Any]] = None):
     tbl = _ddb_table()
@@ -132,6 +263,7 @@ def _query_appointments(patient_id: str, limit: int, start_key: Optional[Dict[st
         "items": normalized,
         "lastEvaluatedKey": resp.get("LastEvaluatedKey"),
     }
+
 
 # -----------------------------
 # GET /appointments/{patientId}
@@ -152,7 +284,15 @@ def list_appointments_for_patient(
         start_key = None
         if startKey_patientId and startKey_appointmentId:
             start_key = {"patientId": startKey_patientId, "appointmentId": startKey_appointmentId}
-        return _query_appointments(patientId, limit, start_key)
+
+        data = _query_appointments(patientId, limit, start_key)
+        data["patientId"] = patientId
+
+        patient_name = _patient_display_name_from_id(patientId)
+        if patient_name:
+            data["patientName"] = patient_name
+
+        return data
     except ClientError as e:
         msg = e.response["Error"].get("Message", str(e))
         log.exception("DynamoDB query failed")
@@ -160,6 +300,7 @@ def list_appointments_for_patient(
     except Exception as e:
         log.exception("Unexpected error")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # -----------------------------------
 # GET /appointments/by-phone?phone=…
@@ -183,7 +324,7 @@ def list_by_phone(
     if not e164:
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
-    patient_id = _cognito_sub_from_phone(e164)
+    patient_id, patient_name = _cognito_identity_from_phone(e164)
     if not patient_id:
         return {"items": [], "patientId": None, "normalizedPhone": e164}
 
@@ -194,4 +335,6 @@ def list_by_phone(
     data = _query_appointments(patient_id, limit, start_key)
     data["patientId"] = patient_id
     data["normalizedPhone"] = e164
+    if patient_name:
+        data["patientName"] = patient_name
     return data

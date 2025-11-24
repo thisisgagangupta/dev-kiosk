@@ -134,3 +134,6 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* frontend/src/index.css (add at bottom) */
+html, body, #root { height: 100%; }

@@ -10,10 +10,10 @@ export interface ServiceItem {
 }
 
 export const TAX_RATE = 0.10; // 10% GST
-export const DEFAULT_REGISTRATION_FEE = 50;
+export const DEFAULT_REGISTRATION_FEE = 1;
 
 export const SERVICE_CATALOG: ServiceItem[] = [
-  { id: "consultation", name: "Consultation", price: 500, description: "Doctor consultation", selectable: true },
+  { id: "consultation", name: "Consultation", price: 2, description: "Doctor consultation", selectable: true },
   { id: "followup",     name: "Doctor's Follow-up", price: 300, description: "Follow-up within policy window", selectable: true },
   // Registration is added automatically for walk-ins, not a toggle
   { id: "registration", name: "Registration Fee", price: DEFAULT_REGISTRATION_FEE, selectable: false },

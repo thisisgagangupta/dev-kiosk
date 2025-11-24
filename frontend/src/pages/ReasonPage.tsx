@@ -95,59 +95,83 @@ export default function ReasonPage() {
   };
 
   // inside ReasonPage.tsx
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string || "").replace(/\/+$/, "");
+  const API_BASE = (import.meta.env.VITE_API_BASE_URL as string || "").replace(/\/+$/, "");
 
-const handleSubmit = async () => {
-  if (selectedReasons.length === 0 && !customReason.trim()) {
-    toast({ variant: "destructive", title: "Reason Required", description: "Please select at least one reason or describe your condition." });
-    return;
-  }
-
-  setLoading(true);
-  try {
-    const patientId = sessionStorage.getItem("kioskPatientId") || "";
-    const appointmentId = sessionStorage.getItem("kioskSelectedAppointmentId") || "";
-
-    // Save local (as you already do)
-    const visitData = {
-      reasons: selectedReasons,
-      customReason: customReason.trim(),
-      voice: { used: isRecording || Boolean(customReason.trim()), lang: whisperLang || "auto" },
-      timestamp: new Date().toISOString(),
-    };
-    localStorage.setItem("medmitra-visit-reason", JSON.stringify(visitData));
-
-    // Send to backend (attach to appointment)
-    if (patientId && appointmentId) {
-      await fetch(`${API_BASE}/api/kiosk/appointments/attach`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          patientId,
-          appointmentId,
-          kiosk: {
-            reason: {
-              selected: selectedReasons,
-              custom: customReason.trim(),
-              voice: { used: isRecording || Boolean(customReason.trim()), lang: whisperLang || "auto" },
-            }
-          }
-        }),
-        credentials: "include",
-      }).catch(() => {});
+  const handleSubmit = async () => {
+    if (selectedReasons.length === 0 && !customReason.trim()) {
+      toast({ variant: "destructive", title: "Reason Required", description: "Please select at least one reason or describe your condition." });
+      return;
     }
 
-    const flow = sessionStorage.getItem("kioskFlow");
-    const nextPath = (flow === "walkin") ? "/payment" : "/token";
+    setLoading(true);
+    try {
+      const patientId = sessionStorage.getItem("kioskPatientId") || "";
+      const appointmentId = sessionStorage.getItem("kioskSelectedAppointmentId") || "";
 
-    toast({ title: "Visit Reason Recorded", description: "Proceeding to check-in process." });
-    navigate(nextPath);
-  } catch (e: any) {
-    toast({ variant: "destructive", title: "Failed to save reason", description: e?.message || "Please try again." });
-  } finally {
-    setLoading(false);
-  }
-};
+      // Save local (as you already do)
+      const visitData = {
+        reasons: selectedReasons,
+        customReason: customReason.trim(),
+        voice: { used: isRecording || Boolean(customReason.trim()), lang: whisperLang || "auto" },
+        timestamp: new Date().toISOString(),
+      };
+      localStorage.setItem("medmitra-visit-reason", JSON.stringify(visitData));
+
+      // Send to backend (attach to appointment)
+      if (patientId && appointmentId) {
+        await fetch(`${API_BASE}/api/kiosk/appointments/attach`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            patientId,
+            appointmentId,
+            kiosk: {
+              reason: {
+                selected: selectedReasons,
+                custom: customReason.trim(),
+                voice: { used: isRecording || Boolean(customReason.trim()), lang: whisperLang || "auto" },
+              }
+            }
+          }),
+          credentials: "include",
+        }).catch(() => {});
+      }
+
+      // Decide next step:
+      // - Walk-in → always go to Payment
+      // - Identify → Payment if appointment is unpaid, otherwise Token
+      const flow = (sessionStorage.getItem("kioskFlow") || "identify") as "walkin" | "identify";
+
+      let nextPath = "/token";
+      if (flow === "walkin") {
+        nextPath = "/payment";
+      } else {
+        // identify flow: inspect selected appointment for payment status
+        try {
+          const raw = sessionStorage.getItem("kioskSelectedAppointmentRaw");
+          if (raw) {
+            const appt = JSON.parse(raw);
+            const status = String(
+              (appt?.payment?.status || appt?.status || "")
+            ).toUpperCase();
+            const isUnpaid = status === "PENDING" || status === "UNPAID";
+            if (isUnpaid) {
+              nextPath = "/payment";
+            }
+          }
+        } catch {
+          // if something goes wrong, default (/token) is safe
+        }
+      }
+
+      toast({ title: "Visit Reason Recorded", description: "Proceeding to check-in process." });
+      navigate(nextPath);
+    } catch (e: any) {
+      toast({ variant: "destructive", title: "Failed to save reason", description: e?.message || "Please try again." });
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
     <KioskLayout title="Reason for Visit">
@@ -262,37 +286,36 @@ const handleSubmit = async () => {
         )}
 
         {/* Document Upload Section */}
-{!showDocumentUpload ? (
-  <Card className="p-6 mb-6 bg-accent/5 border border-accent/20">
-    <div className="flex items-center justify-between">
-      <div className="flex items-center gap-4">
-        <div className="bg-accent/10 rounded-full p-3">
-          <Upload className="h-6 w-6 text-accent" />
-        </div>
-        <div>
-          <h3 className="text-lg font-semibold text-foreground">Upload Medical Documents</h3>
-          <p className="text-sm text-muted-foreground">Share previous reports to help your doctor</p>
-        </div>
-      </div>
-      <Button
-        onClick={() => setShowDocumentUpload(true)}
-        variant="outline"
-        className="border-accent text-accent hover:bg-accent hover:text-accent-foreground"
-      >
-        Upload Documents
-      </Button>
-    </div>
-  </Card>
-) : (
-  <div className="mb-6">
-    {/* Pull the patientId from sessionStorage (set by Identify/Walkin pages) */}
-    <DocumentUploadQR
-      patientId={sessionStorage.getItem("kioskPatientId") || ""}
-      onSkip={() => setShowDocumentUpload(false)}
-    />
-  </div>
-)}
-
+        {!showDocumentUpload ? (
+          <Card className="p-6 mb-6 bg-accent/5 border border-accent/20">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-4">
+                <div className="bg-accent/10 rounded-full p-3">
+                  <Upload className="h-6 w-6 text-accent" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-foreground">Upload Medical Documents</h3>
+                  <p className="text-sm text-muted-foreground">Share previous reports to help your doctor</p>
+                </div>
+              </div>
+              <Button
+                onClick={() => setShowDocumentUpload(true)}
+                variant="outline"
+                className="border-accent text-accent hover:bg-accent hover:text-accent-foreground"
+              >
+                Upload Documents
+              </Button>
+            </div>
+          </Card>
+        ) : (
+          <div className="mb-6">
+            {/* Pull the patientId from sessionStorage (set by Identify/Walkin pages) */}
+            <DocumentUploadQR
+              patientId={sessionStorage.getItem("kioskPatientId") || ""}
+              onSkip={() => setShowDocumentUpload(false)}
+            />
+          </div>
+        )}
 
         {/* Action Buttons */}
         <div className="flex gap-4">

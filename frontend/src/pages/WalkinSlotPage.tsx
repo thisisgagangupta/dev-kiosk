@@ -7,14 +7,50 @@ import { Badge } from "@/components/ui/badge";
 import { Label } from "@/components/ui/label";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "@/components/ui/select";
 import { Calendar } from "@/components/ui/calendar";
-import { Stethoscope, MapPin, Star, Clock, AlertTriangle, Users, CheckCircle2, Calendar as CalendarIcon } from "lucide-react";
+import {
+  Stethoscope, MapPin, Star, Clock, AlertTriangle, Users,
+  CheckCircle2, Calendar as CalendarIcon, XCircle
+} from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { getStoredLanguage, useTranslation } from "@/lib/i18n";
 import { Separator } from "@/components/ui/separator";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string || "").replace(/\/+$/, "");
 
-// ---- helpers ----
+/* ----------------- helpers ----------------- */
+
+function pad2(n: number) { return String(n).padStart(2, "0"); }
+
+/** Strict HH:mm -> HH:mm; also best-effort normalize things like "9:0", "9:00 AM" */
+function normalizeHHMM(raw: string): string {
+  if (!raw) return raw;
+  const s = raw.trim().toUpperCase();
+  // Handle "HH:mm AM/PM" quickly
+  const ampm = s.endsWith("AM") || s.endsWith("PM") ? s.slice(-2) : "";
+  const core = ampm ? s.slice(0, -2).trim() : s;
+  const parts = core.split(":").map(x => x.trim()).filter(Boolean);
+  let h = parseInt(parts[0] || "0", 10);
+  let m = parseInt(parts[1] || "0", 10);
+  if (ampm) {
+    if (ampm === "AM") { if (h === 12) h = 0; }
+    else { if (h !== 12) h += 12; }
+  }
+  if (Number.isNaN(h) || Number.isNaN(m)) return raw;
+  if (h < 0 || h > 23 || m < 0 || m > 59) return raw;
+  return `${pad2(h)}:${pad2(m)}`;
+}
+
+const HHMM_RE = /^\d{2}:\d{2}$/;
+
+function toSortedUniqueHHMM(list: string[]): string[] {
+  // normalize + keep only strict HH:mm
+  const norm = list.map((s) => normalizeHHMM(s)).filter((s) => HHMM_RE.test(s));
+  const uniq = Array.from(new Set(norm));
+  // sort on a COPY (eslint/immutability-friendly)
+  return [...uniq].sort(compareHHMM);
+}
+
+
 function generateQuarterHourSlots(start = "08:00", end = "20:00"): string[] {
   const [sh, sm] = start.split(":").map(Number);
   const [eh, em] = end.split(":").map(Number);
@@ -23,12 +59,20 @@ function generateQuarterHourSlots(start = "08:00", end = "20:00"): string[] {
     for (let m of [0, 15, 30, 45]) {
       if (h === sh && m < sm) continue;
       if (h > eh || (h === eh && m >= (em || 0))) break;
-      out.push(`${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`);
+      out.push(`${pad2(h)}:${pad2(m)}`);
     }
   }
   return out;
 }
-function dateToLocalYYYYMMDD(d: Date) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()).toISOString().slice(0, 10); }
+
+function dateToLocalYYYYMMDD(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+
 function filterPastSlots(date: Date, all: string[]) {
   const today = new Date();
   const same = today.toDateString() === date.toDateString();
@@ -39,14 +83,16 @@ function filterPastSlots(date: Date, all: string[]) {
     return h > curH || (h === curH && m > curM);
   });
 }
-function addMinutes(HHMM: string, mins: number) {
-  const [h, m] = HHMM.split(":").map(Number);
-  const t = new Date(2000, 0, 1, h, m);
-  t.setMinutes(t.getMinutes() + mins);
-  return `${String(t.getHours()).padStart(2,"0")}:${String(t.getMinutes()).padStart(2,"0")}`;
+
+function compareHHMM(a: string, b: string) {
+  if (a === b) return 0;
+  const [ah, am] = a.split(":").map(Number);
+  const [bh, bm] = b.split(":").map(Number);
+  if (ah !== bh) return ah - bh;
+  return am - bm;
 }
 
-// ---- demo doctors list (replace with API later) ----
+/* ---------- demo doctors list (replace with API when ready) ---------- */
 type Doctor = { id: string; name: string; specialty: string; clinicName: string; rating?: number; qualifications?: string; };
 const DOCTORS: Doctor[] = [
   { id: "1", name: "Dr. Michael Chen", specialty: "General Medicine", clinicName: "MedMitra Downtown Clinic", rating: 4.8, qualifications: "MBBS, MD" },
@@ -66,34 +112,23 @@ export default function WalkinSlotPage() {
   const doctor = useMemo(() => DOCTORS.find(d => d.id === selectedDoctorId)!, [selectedDoctorId]);
 
   const [selectedDate, setSelectedDate] = useState<Date | undefined>(new Date());
-  const [selectedSlot, setSelectedSlot] = useState<string>("");
-
   const [booked, setBooked] = useState<string[]>([]);
+  const [selectedSlots, setSelectedSlots] = useState<string[]>([]);
+
   const [loading, setLoading] = useState(false);
   const [booking, setBooking] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const allSlots = useMemo(() => generateQuarterHourSlots("08:00", "20:00"), []);
-  const visibleSlots = useMemo(() => {
+  const availableSlots = useMemo(() => {
     if (!selectedDate) return [];
-    const base = filterPastSlots(selectedDate, allSlots);
-    return base.filter((s) => !booked.includes(s));
+    const futureOnly = filterPastSlots(selectedDate, allSlots);
+    // ↓ show ONLY free slots
+    const bookedSet = new Set(booked.map(normalizeHHMM));
+    return futureOnly.filter((s) => !bookedSet.has(s));
   }, [selectedDate, allSlots, booked]);
 
-  // compute consecutive slots preview for the group
-  const requiredSlots = useMemo(() => {
-    if (!selectedSlot) return [];
-    const arr = [selectedSlot];
-    for (let i = 1; i < groupSize; i++) arr.push(addMinutes(selectedSlot, 15 * i));
-    return arr;
-  }, [selectedSlot, groupSize]);
-
-  const hasAllConsecutive = useMemo(() => {
-    if (!selectedSlot) return false;
-    return requiredSlots.every((s) => visibleSlots.includes(s));
-  }, [requiredSlots, visibleSlots, selectedSlot]);
-
-  // Ensure identity exists
+  // guard: identity
   useEffect(() => {
     if (!patientId) {
       toast({ variant: "destructive", title: "Session Expired", description: "Please verify again." });
@@ -101,7 +136,7 @@ export default function WalkinSlotPage() {
     }
   }, [patientId, navigate, toast]);
 
-  // Availability fetch + freshness
+  // availability fetch + polling
   const pollingRef = useRef<number | null>(null);
   useEffect(() => {
     let aborted = false;
@@ -117,7 +152,13 @@ export default function WalkinSlotPage() {
         const res = await fetch(url.toString(), { cache: "no-store" });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || `Failed to load availability (${res.status})`);
-        if (!aborted) setBooked((data.booked || []) as string[]);
+        if (!aborted) {
+          // normalize to strict HH:mm once here
+          const normalized = (data.booked || []).map((s: string) => normalizeHHMM(s));
+          setBooked(toSortedUniqueHHMM(data.booked || []));
+          // remove any user-selected slot that just became booked
+          setSelectedSlots((prev) => prev.filter((s) => !normalized.includes(s)));
+        }
       } catch (e: any) {
         if (!aborted) { setError(e?.message || "Failed to load availability"); setBooked([]); }
       } finally {
@@ -138,29 +179,50 @@ export default function WalkinSlotPage() {
     };
   }, [doctor, selectedDate]);
 
-  // If a selected slot becomes booked, clear it immediately
+  // also prune selection if booked list changes due to race
   useEffect(() => {
-    if (selectedSlot && booked.includes(selectedSlot)) setSelectedSlot("");
-  }, [booked, selectedSlot]);
+    setSelectedSlots((prev) => prev.filter((s) => !booked.includes(s)));
+  }, [booked]);
 
-  async function handleBook() {
-    if (!patientId || !doctor || !selectedDate || !selectedSlot) return;
-    if (groupSize > 1 && !hasAllConsecutive) {
-      toast({ variant: "destructive", title: "Not enough consecutive slots", description: "Please pick a different start time." });
+  function toggleSlot(slot: string) {
+    if (selectedSlots.includes(slot)) {
+      setSelectedSlots(selectedSlots.filter((s) => s !== slot));
       return;
     }
+    if (selectedSlots.length >= groupSize) {
+      toast({
+        variant: "destructive",
+        title: `You can select up to ${groupSize} slot${groupSize > 1 ? "s" : ""}`,
+        description: "Deselect a time to pick another.",
+      });
+      return;
+    }
+    setSelectedSlots([...selectedSlots, slot].sort(compareHHMM));
+  }
+
+  async function handleBook() {
+    if (!patientId || !doctor || !selectedDate || selectedSlots.length === 0) return;
+    if (selectedSlots.length !== groupSize) {
+      toast({
+        variant: "destructive",
+        title: `Please select ${groupSize} slot${groupSize > 1 ? "s" : ""}`,
+        description: `Currently selected: ${selectedSlots.length}`,
+      });
+      return;
+    }
+
     setBooking(true); setError(null);
     try {
       const dateISO = dateToLocalYYYYMMDD(selectedDate);
 
-      if (groupSize === 1) {
-        // single booking → existing endpoint
+      // single vs batch
+      if (selectedSlots.length === 1) {
         const payload = {
           patientId,
           contact: { phone, name: "" },
           appointment_details: {
             dateISO,
-            timeSlot: selectedSlot,
+            timeSlot: selectedSlots[0],
             clinicName: doctor.clinicName,
             specialty: doctor.specialty,
             doctorId: doctor.id,
@@ -185,11 +247,11 @@ export default function WalkinSlotPage() {
           return;
         }
         if (!res.ok) throw new Error(data.detail || `Booking failed (${res.status})`);
+        // stash for downstream pages
         const apptId = data.appointmentId as string;
         sessionStorage.setItem("kioskSelectedAppointmentId", apptId);
         sessionStorage.setItem("kioskSelectedAppointmentRaw", JSON.stringify(data));
       } else {
-        // group booking → batch endpoint
         const payload = {
           patientId,
           contact: { phone, name: "" },
@@ -203,7 +265,7 @@ export default function WalkinSlotPage() {
             appointmentType: "walkin",
             symptoms: "", fee: "", languages: [],
           },
-          timeSlots: requiredSlots, // consecutive slots
+          timeSlots: selectedSlots, // free (not necessarily consecutive)
           source: "kiosk",
         };
         const res = await fetch(`${API_BASE}/api/appointments/book-batch`, {
@@ -216,12 +278,11 @@ export default function WalkinSlotPage() {
         if (res.status === 409) {
           await refreshAfterRace(dateISO);
           const bad = (data.conflicts || []).join(", ");
-          toast({ variant: "destructive", title: "Some slots just got taken", description: bad ? `Conflicts: ${bad}` : "Pick another start time." });
+          toast({ variant: "destructive", title: "Some slots just got taken", description: bad ? `Conflicts: ${bad}` : "Pick different times." });
           setBooking(false);
           return;
         }
         if (!res.ok) throw new Error(data.detail || `Batch booking failed (${res.status})`);
-        // remember the first appointment id for downstream pages (reason/payment/token)
         const first = Array.isArray(data.appointments) ? data.appointments[0] : null;
         if (first?.appointmentId) {
           sessionStorage.setItem("kioskSelectedAppointmentId", first.appointmentId);
@@ -230,7 +291,12 @@ export default function WalkinSlotPage() {
       }
 
       sessionStorage.setItem("kioskFlow", "walkin");
-      toast({ title: "Appointment(s) Booked", description: groupSize > 1 ? `Booked ${groupSize} consecutive slots.` : "Proceeding to reason." });
+      toast({
+        title: "Appointment(s) Booked",
+        description: selectedSlots.length > 1
+          ? `Booked ${selectedSlots.length} slot(s).`
+          : "Booking confirmed.",
+      });
       navigate("/reason");
     } catch (e: any) {
       setError(e?.message || "Failed to book appointment");
@@ -247,22 +313,24 @@ export default function WalkinSlotPage() {
       url.searchParams.set("date", dateISO);
       const r2 = await fetch(url.toString());
       const d2 = await r2.json().catch(() => ({}));
-      setBooked((d2.booked || []) as string[]);
-      if (selectedSlot && (d2.booked || []).includes(selectedSlot)) setSelectedSlot("");
+      const normalized = (d2.booked || []).map((s: string) => normalizeHHMM(s));
+      setBooked(normalized);
+      setSelectedSlots((prev) => prev.filter((s) => !normalized.includes(s)));
     } catch {}
   }
 
-  const earliest = visibleSlots[0];
+  const earliest = availableSlots[0];
+  const canBook = !!doctor && !!selectedDate && selectedSlots.length === groupSize && !booking;
 
   return (
     <KioskLayout title="Book Walk-in Appointment">
       <div className="max-w-7xl mx-auto px-4">
-        {/* Header Section */}
+        {/* Header */}
         <div className="text-center mb-8">
           <h1 className="text-4xl font-bold mb-3">Book Your Walk-in Appointment</h1>
           <p className="text-lg text-muted-foreground">
-            {groupSize > 1 
-              ? `Booking for ${groupSize} people - ${groupSize} consecutive slots will be reserved`
+            {groupSize > 1
+              ? `Select ${groupSize} separate time slot${groupSize > 1 ? "s" : ""} for your group`
               : "Select your preferred doctor, date, and time slot"}
           </p>
         </div>
@@ -283,9 +351,9 @@ export default function WalkinSlotPage() {
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Left Column - Doctor & Date Selection */}
+          {/* Left: Doctor + Date + Slots */}
           <div className="lg:col-span-2 space-y-6">
-            {/* Step 1: Doctor Selection */}
+            {/* 1. Doctor */}
             <Card className="shadow-md">
               <CardHeader className="space-y-1 pb-4">
                 <div className="flex items-center gap-2">
@@ -293,7 +361,7 @@ export default function WalkinSlotPage() {
                     <span className="text-sm font-bold text-primary">1</span>
                   </div>
                   <CardTitle className="flex items-center gap-2">
-                    <Stethoscope className="h-5 w-5" /> 
+                    <Stethoscope className="h-5 w-5" />
                     Choose Your Doctor
                   </CardTitle>
                 </div>
@@ -302,7 +370,7 @@ export default function WalkinSlotPage() {
               <CardContent className="space-y-4">
                 <div className="space-y-2">
                   <Label htmlFor="doctor-select" className="text-base">Available Doctors</Label>
-                  <Select value={selectedDoctorId} onValueChange={setSelectedDoctorId}>
+                  <Select value={selectedDoctorId} onValueChange={(v) => { setSelectedDoctorId(v); setSelectedSlots([]); }}>
                     <SelectTrigger id="doctor-select" className="h-12">
                       <SelectValue placeholder="Choose a doctor" />
                     </SelectTrigger>
@@ -352,7 +420,7 @@ export default function WalkinSlotPage() {
                     <div className="flex-1">
                       <p className="text-sm font-medium">Group Booking</p>
                       <p className="text-xs text-muted-foreground">
-                        {groupSize} consecutive time slots will be reserved
+                        Select {groupSize} separate time slots for your group.
                       </p>
                     </div>
                     <Badge variant="secondary" className="text-base px-3 py-1">
@@ -363,7 +431,7 @@ export default function WalkinSlotPage() {
               </CardContent>
             </Card>
 
-            {/* Step 2: Date & Time Selection */}
+            {/* 2. Date */}
             <Card className="shadow-md">
               <CardHeader className="space-y-1 pb-4">
                 <div className="flex items-center gap-2">
@@ -371,7 +439,7 @@ export default function WalkinSlotPage() {
                     <span className="text-sm font-bold text-primary">2</span>
                   </div>
                   <CardTitle className="flex items-center gap-2">
-                    <CalendarIcon className="h-5 w-5" /> 
+                    <CalendarIcon className="h-5 w-5" />
                     Select Date
                   </CardTitle>
                 </div>
@@ -382,10 +450,7 @@ export default function WalkinSlotPage() {
                   <Calendar
                     mode="single"
                     selected={selectedDate}
-                    onSelect={(d) => { 
-                      setSelectedSlot(""); 
-                      setSelectedDate(d || new Date()); 
-                    }}
+                    onSelect={(d) => { setSelectedSlots([]); setSelectedDate(d || new Date()); }}
                     className="rounded-md border"
                     disabled={(d) => d < new Date(new Date().setHours(0,0,0,0))}
                   />
@@ -393,7 +458,7 @@ export default function WalkinSlotPage() {
               </CardContent>
             </Card>
 
-            {/* Step 3: Time Slot Selection */}
+            {/* 3. Time Slots */}
             <Card className="shadow-md">
               <CardHeader className="space-y-1 pb-4">
                 <div className="flex items-center justify-between">
@@ -402,8 +467,8 @@ export default function WalkinSlotPage() {
                       <span className="text-sm font-bold text-primary">3</span>
                     </div>
                     <CardTitle className="flex items-center gap-2">
-                      <Clock className="h-5 w-5" /> 
-                      Choose Time Slot
+                      <Clock className="h-5 w-5" />
+                      Choose Time Slot{groupSize > 1 ? "s" : ""}
                     </CardTitle>
                   </div>
                   {earliest && (
@@ -424,7 +489,7 @@ export default function WalkinSlotPage() {
                     <p className="text-lg font-medium">Loading available slots...</p>
                     <p className="text-sm">Please wait</p>
                   </div>
-                ) : visibleSlots.length === 0 ? (
+                ) : availableSlots.length === 0 ? (
                   <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
                     <AlertTriangle className="h-12 w-12 mb-3" />
                     <p className="text-lg font-medium">No slots available</p>
@@ -433,21 +498,17 @@ export default function WalkinSlotPage() {
                 ) : (
                   <div className="space-y-4">
                     <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-2">
-                      {visibleSlots.map((slot) => {
-                        const selected = selectedSlot === slot;
-                        const inGroup = requiredSlots.includes(slot);
-                        
+                      {availableSlots.map((slot) => {
+                        const selected = selectedSlots.includes(slot);
                         return (
                           <Button
                             key={slot}
                             variant={selected ? "default" : "outline"}
-                            className={`h-14 text-base font-medium relative ${
-                              selected ? "ring-2 ring-primary ring-offset-2" : ""
-                            } ${inGroup && !selected ? "bg-primary/10 border-primary/30" : ""}`}
-                            onClick={() => setSelectedSlot(slot)}
+                            className={`h-14 text-base font-medium relative ${selected ? "ring-2 ring-primary ring-offset-2" : ""}`}
+                            onClick={() => toggleSlot(slot)}
                           >
                             {slot}
-                            {inGroup && (
+                            {selected && (
                               <CheckCircle2 className="h-3 w-3 absolute -top-1 -right-1 text-primary" />
                             )}
                           </Button>
@@ -455,41 +516,26 @@ export default function WalkinSlotPage() {
                       })}
                     </div>
 
-                    {/* Group Preview */}
-                    {groupSize > 1 && selectedSlot && (
-                      <div className={`p-4 rounded-lg border-2 ${
-                        hasAllConsecutive 
-                          ? "bg-primary/5 border-primary/30" 
-                          : "bg-destructive/5 border-destructive/30"
-                      }`}>
+                    {selectedSlots.length > 0 && (
+                      <div className="p-4 rounded-lg bg-muted/50 border">
                         <div className="flex items-start gap-3">
-                          {hasAllConsecutive ? (
-                            <CheckCircle2 className="h-5 w-5 text-primary mt-0.5" />
-                          ) : (
-                            <AlertTriangle className="h-5 w-5 text-destructive mt-0.5" />
-                          )}
+                          <CheckCircle2 className="h-5 w-5 text-primary mt-0.5" />
                           <div className="flex-1 space-y-2">
-                            <p className={`font-semibold ${
-                              hasAllConsecutive ? "text-primary" : "text-destructive"
-                            }`}>
-                              {hasAllConsecutive 
-                                ? `✓ ${groupSize} Consecutive Slots Reserved` 
-                                : `⚠ Not Enough Consecutive Slots`}
+                            <p className="font-semibold">
+                              Selected ({selectedSlots.length}/{groupSize})
                             </p>
-                            {hasAllConsecutive ? (
-                              <div className="flex flex-wrap gap-2">
-                                {requiredSlots.map((s, idx) => (
-                                  <Badge key={s} variant="secondary" className="text-sm">
-                                    {idx + 1}. {s}
-                                  </Badge>
-                                ))}
-                              </div>
-                            ) : (
-                              <p className="text-sm text-destructive/90">
-                                Please select a different start time with {groupSize} consecutive available slots.
-                              </p>
-                            )}
+                            <div className="flex flex-wrap gap-2">
+                              {selectedSlots.map((s, idx) => (
+                                <Badge key={s} variant="secondary" className="text-sm">
+                                  {idx + 1}. {s}
+                                </Badge>
+                              ))}
+                            </div>
                           </div>
+                          <Button variant="ghost" size="sm" onClick={() => setSelectedSlots([])} className="text-destructive">
+                            <XCircle className="h-4 w-4 mr-1" />
+                            Clear
+                          </Button>
                         </div>
                       </div>
                     )}
@@ -499,10 +545,9 @@ export default function WalkinSlotPage() {
             </Card>
           </div>
 
-          {/* Right Column - Summary & Actions */}
+          {/* Right: Summary & Actions */}
           <div className="lg:col-span-1">
             <div className="sticky top-4 space-y-4">
-              {/* Booking Summary */}
               <Card className="shadow-md">
                 <CardHeader>
                   <CardTitle className="text-lg">Booking Summary</CardTitle>
@@ -538,10 +583,16 @@ export default function WalkinSlotPage() {
                     <div className="flex items-start gap-3 pb-3 border-b">
                       <Clock className="h-4 w-4 text-muted-foreground mt-1" />
                       <div className="flex-1 min-w-0">
-                        <p className="text-xs text-muted-foreground mb-1">Time</p>
-                        <p className="font-medium text-sm">
-                          {selectedSlot || "Not selected"}
-                        </p>
+                        <p className="text-xs text-muted-foreground mb-1">Selected Time{selectedSlots.length > 1 ? "s" : ""}</p>
+                        {selectedSlots.length ? (
+                          <div className="flex flex-wrap gap-2">
+                            {selectedSlots.map((s, idx) => (
+                              <Badge key={s} variant="secondary">{idx + 1}. {s}</Badge>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-sm">None</p>
+                        )}
                       </div>
                     </div>
 
@@ -559,18 +610,7 @@ export default function WalkinSlotPage() {
                   <Separator />
 
                   <div className="space-y-2">
-                    <Button
-                      className="w-full h-12 text-base font-semibold"
-                      size="lg"
-                      onClick={handleBook}
-                      disabled={
-                        !selectedSlot || 
-                        !selectedDate || 
-                        !doctor || 
-                        booking || 
-                        (groupSize > 1 && !hasAllConsecutive)
-                      }
-                    >
+                    <Button className="w-full h-12 text-base font-semibold" size="lg" onClick={handleBook} disabled={!canBook}>
                       {booking ? (
                         <>
                           <Clock className="h-4 w-4 animate-spin" />
@@ -584,27 +624,19 @@ export default function WalkinSlotPage() {
                       )}
                     </Button>
 
-                    <Button 
-                      variant="outline" 
-                      className="w-full h-11" 
-                      onClick={() => navigate("/walkin")}
-                      disabled={booking}
-                    >
+                    <Button variant="outline" className="w-full h-11" onClick={() => navigate("/walkin")} disabled={booking}>
                       Back to Walk-in Options
                     </Button>
                   </div>
 
-                  {(!selectedSlot || (groupSize > 1 && !hasAllConsecutive)) && (
+                  {selectedSlots.length !== groupSize && (
                     <p className="text-xs text-center text-muted-foreground">
-                      {!selectedSlot 
-                        ? "Please select a time slot to continue" 
-                        : "Select a valid start time for consecutive slots"}
+                      Please select {groupSize} slot{groupSize > 1 ? "s" : ""} to continue
                     </p>
                   )}
                 </CardContent>
               </Card>
 
-              {/* Help Card */}
               <Card className="bg-muted/50">
                 <CardContent className="pt-6">
                   <div className="text-center space-y-2">

@@ -3,7 +3,7 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
+from app.util.datetime import now_utc_iso, now_epoch_ms, combine_local_to_utc_iso
 from typing import Optional, Dict, Any
 
 import boto3
@@ -33,8 +33,7 @@ tbl_appts = ddb.Table(DDB_TABLE_APPTS)
 tbl_slots = ddb.Table(DDB_TABLE_SLOTS)
 s3 = boto3.client("s3", region_name=AWS_REGION) if S3_BUCKET else None
 
-def _now_iso():
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+TZ = os.getenv("CLINIC_TIME_ZONE", "Asia/Kolkata")
 
 # -------- Schemas (doctor flow parity with patient portal) ----------
 class Contact(BaseModel):
@@ -67,7 +66,7 @@ def _lock_slot(resource_key: str, slot_key: str, patient_id: str, appointment_id
         "slotKey": slot_key,
         "patientId": patient_id,
         "appointmentId": appointment_id,
-        "createdAt": _now_iso(),
+        "createdAt": now_utc_iso(),
     }
     tbl_slots.put_item(Item=item, ConditionExpression="attribute_not_exists(slotKey)")
 
@@ -91,14 +90,16 @@ def book_appointment(payload: BookRequest = Body(...)):
         raise HTTPException(status_code=500, detail=e.response.get("Error", {}).get("Message", str(e)))
 
     # 2) write appointment
-    created_at = _now_iso()
+    created_at = now_utc_iso()
     item: Dict[str, Any] = {
         "patientId": payload.patientId,
         "appointmentId": appointment_id,
         "createdAt": created_at,
+        "createdAtEpoch": now_epoch_ms(),
         "recordType": "doctor",
         "status": "BOOKED",
         "source": payload.source or "kiosk",
+        "timeZone": TZ,
         "contact": payload.contact.dict() if payload.contact else None,
         "appointment_details": appt.dict(),
         # quick query keys
