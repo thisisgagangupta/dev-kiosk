@@ -98,6 +98,7 @@ _mount("app.diagnostics.router:router", "/api", "diagnostics partner")
 # voice + billing
 _mount("app.voice.router:router", "/api", "voice")
 _mount("app.billing.razorpay_router:router", "/api", "razorpay billing")
+_mount("app.notifications.router:router", "/api", "whatsapp notifications")
 
 # -------------------------
 # On startup: list routes

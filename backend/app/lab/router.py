@@ -4,12 +4,14 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
-
 import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, HTTPException, Query, Body
 from pydantic import BaseModel, Field, constr
+from app.notifications.whatsapp import send_lab_booking_confirmation
+from zoneinfo import ZoneInfo
+
 
 log = logging.getLogger("lab-bookings")
 
@@ -213,9 +215,27 @@ def create_walkin_lab_booking(payload: WalkinLabBookingRequest = Body(...)):
         log.exception("DynamoDB put_item failed")
         raise HTTPException(status_code=500, detail=f"DynamoDB error: {msg}")
 
+    # --- WhatsApp booking confirmation (lab / diagnostics) ---
+    try:
+        phone = (payload.phone or "").strip()
+        if phone:
+            # For now, treat walk-in as "today, approximate time"
+            tz = ZoneInfo(os.getenv("CLINIC_TIME_ZONE", "Asia/Kolkata"))
+            now_local = datetime.now(tz)
+            site_id = payload.siteId or "main"
+            send_lab_booking_confirmation(
+                phone_e164=phone,
+                patient_name="",   # unknown here; fine to leave blank
+                when_local=now_local,
+                site_id=site_id,
+            )
+    except Exception:
+        log.warning("Failed to send WhatsApp lab booking confirmation", exc_info=True)
+
     return {
         "appointmentId": appointment_id,
         "patientId": payload.patientId,
         "createdAt": created_at,
         "total": total_price,
     }
+

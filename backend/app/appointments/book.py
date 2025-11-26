@@ -5,11 +5,15 @@ import uuid
 import logging
 from app.util.datetime import now_utc_iso, now_epoch_ms, combine_local_to_utc_iso
 from typing import Optional, Dict, Any
-
+from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, HTTPException, Body
 from pydantic import BaseModel, Field, constr
+from zoneinfo import ZoneInfo
+
+from app.util.datetime import now_utc_iso, now_epoch_ms, combine_local_to_utc_iso
+from app.notifications.whatsapp import send_doctor_booking_confirmation
 
 log = logging.getLogger("appt-book")
 router = APIRouter(prefix="/appointments", tags=["appointments"])
@@ -134,6 +138,32 @@ def book_appointment(payload: BookRequest = Body(...)):
             item["s3Key"] = key
         except Exception:
             log.warning("S3 archive failed for %s/%s", payload.patientId, appointment_id, exc_info=True)
+
+    # 4) WhatsApp doctor booking confirmation (kiosk)
+    try:
+        contact = item.get("contact") or {}
+        phone = (contact.get("phone") or "").strip()
+        # Only send if we have a phone and a valid date/time
+        if phone and appt.dateISO and appt.timeSlot:
+            tz = ZoneInfo(os.getenv("CLINIC_TIME_ZONE", "Asia/Kolkata"))
+            try:
+                y, m, d = [int(x) for x in appt.dateISO.split("-", 2)]
+                hh, mm = [int(x) for x in appt.timeSlot.split(":", 1)]
+                when_local = datetime(y, m, d, hh, mm, tzinfo=tz)
+            except Exception:
+                # Fallback: just use "now" in clinic timezone
+                when_local = datetime.now(tz)
+
+            send_doctor_booking_confirmation(
+                phone_e164=phone,
+                patient_name=contact.get("name") or "",
+                when_local=when_local,
+                doctor_name=appt.doctorName or "",
+                clinic_name=appt.clinicName or "",
+            )
+    except Exception:
+        log.warning("Failed to send WhatsApp doctor booking confirmation", exc_info=True)
+
 
     return {
         "patientId": payload.patientId,

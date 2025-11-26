@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field, constr
 
 from app.db.dynamo import appointments_table
 from app.util.datetime import now_utc_iso
+from zoneinfo import ZoneInfo
+from app.notifications.whatsapp import send_doctor_checkin_confirmation
 
 log = logging.getLogger("queue")
 router = APIRouter(tags=["queue"])
@@ -182,11 +184,65 @@ def issue_token(body: IssueTokenReq = Body(...)):
     }
     tbl_tokens.put_item(Item=item)
 
+    # --- WhatsApp check-in confirmation (doctor only for now) ---
+    try:
+        record_type = (appt.get("recordType") or "").lower()
+
+        # contact & phone
+        contact = appt.get("contact") or {}
+        phone = (contact.get("phone") or contact.get("phoneNumber") or "").strip()
+        if phone:
+            tz = ZoneInfo(os.getenv("CLINIC_TIME_ZONE", "Asia/Kolkata"))
+
+            # Extract date/time similar to reminder lambda
+            details_local = _get_appointment_details(appt)
+            collection = appt.get("collection") or {}
+            date_iso_full = (
+                appt.get("dateISO")
+                or details_local.get("dateISO")
+                or collection.get("preferredDateISO")
+                or ""
+            )
+            time_slot = (
+                appt.get("timeSlot")
+                or details_local.get("timeSlot")
+                or collection.get("preferredSlot")
+                or ""
+            )
+
+            if date_iso_full and time_slot and record_type == "doctor":
+                y, m, d = [int(x) for x in date_iso_full.split("-", 2)]
+                hh, mm = [int(x) for x in time_slot.split(":", 1)]
+                when_local = datetime(y, m, d, hh, mm, tzinfo=tz)
+                doctor_name = (
+                    details_local.get("doctorName")
+                    or appt.get("doctorName")
+                    or "Doctor"
+                )
+                clinic_name = (
+                    details_local.get("clinicName")
+                    or appt.get("clinicName")
+                    or "Clinic"
+                )
+                send_doctor_checkin_confirmation(
+                    phone_e164=phone,
+                    patient_name=contact.get("name") or "",
+                    when_local=when_local,
+                    doctor_name=doctor_name,
+                    clinic_name=clinic_name,
+                    token_no=token_no,
+                )
+            # If you also want a different wording for lab check in, you can
+            # add an elif record_type == "lab": branch here and call a lab-specific helper.
+    except Exception:
+        log.warning("Failed to send WhatsApp check-in confirmation", exc_info=True)
+
     return IssueTokenResp(
-        tokenNo=token_no, lane=lane, position=ahead,
-        etaLow=eta["etaLow"], etaHigh=eta["etaHigh"], confidence=eta["confidence"],
-        appointmentId=body.appointmentId, patientId=body.patientId, status="waiting",
-    )
+    tokenNo=token_no, lane=lane, position=ahead,
+    etaLow=eta["etaLow"], etaHigh=eta["etaHigh"], confidence=eta["confidence"],
+    appointmentId=body.appointmentId, patientId=body.patientId, status="waiting",
+)
+
 
 class StatusResp(BaseModel):
     tokenNo: str
