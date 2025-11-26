@@ -305,13 +305,9 @@
 
 
 
-
-
-
 import os
 import re
 import time
-import json
 import uuid
 import random
 import logging
@@ -338,17 +334,13 @@ if not COGNITO_USER_POOL_ID:
 
 DDB_TABLE_OTP = os.getenv("DDB_TABLE_KIOSK_OTP", "kiosk_otp")
 
-# 5-minute expiry by default
+# 5 minutes by default
 OTP_TTL_SECONDS = int(os.getenv("OTP_TTL_SECONDS", "300"))
 
-# Allow both OTP_LENGTH and legacy OTP_CODE_LENGTH
-OTP_LENGTH = int(
-    os.getenv("OTP_LENGTH")
-    or os.getenv("OTP_CODE_LENGTH")
-    or "6"
-)
+# Prefer OTP_LENGTH, but fall back to OTP_CODE_LENGTH for backwards compat
+OTP_LENGTH = int(os.getenv("OTP_LENGTH", os.getenv("OTP_CODE_LENGTH", "6")))
 
-# We keep this in case you want to use it later, but we no longer block resend
+# Cooldown between *sending* SMS messages (seconds)
 OTP_RESEND_COOLDOWN = int(os.getenv("OTP_RESEND_COOLDOWN", "45"))
 
 KIOSK_REQUIRE_VERIFIED = (
@@ -404,13 +396,16 @@ def normalize_phone(mobile: str, country_code: str) -> str:
             return f"+{digits}"
     return f"+{country_code.strip('+')}{digits}"
 
+
 def _gen_code(n: int) -> str:
     lo = 10 ** (n - 1)
     hi = (10 ** n) - 1
     return str(random.randint(lo, hi))
 
+
 def _attrs_map(user: dict) -> dict:
     return {a["Name"]: a["Value"] for a in user.get("Attributes", [])}
+
 
 def _find_cognito_user_by_phone(e164: str) -> Optional[dict]:
     try:
@@ -448,6 +443,7 @@ def _find_cognito_user_by_phone(e164: str) -> Optional[dict]:
             detail=f"Cognito error: {e.response['Error'].get('Message', 'unknown')}",
         )
 
+
 def _put_otp_session(phone: str, user_sub: str, code: str) -> str:
     now_epoch = int(time.time())
     ttl_epoch = now_epoch + OTP_TTL_SECONDS
@@ -465,26 +461,6 @@ def _put_otp_session(phone: str, user_sub: str, code: str) -> str:
     otp_table.put_item(Item=item)
     return session_id
 
-def _update_resend(existing: dict, new_code: str):
-    """
-    Update existing OTP session with a NEW code and fresh TTL.
-    This is used for both resend and "send again quickly" – frontend
-    always shows "OTP sent", so backend must always actually send.
-    """
-    now_epoch = int(time.time())
-    ttl_epoch = now_epoch + OTP_TTL_SECONDS
-    otp_table.update_item(
-        Key={"phone": existing["phone"], "sessionId": existing["sessionId"]},
-        UpdateExpression="SET #c=:c, #ls=:ls, #ttl=:ttl, attempts=:z",
-        ExpressionAttributeNames={"#c": "code", "#ls": "lastSendAt", "#ttl": "ttl"},
-        ExpressionAttributeValues={
-            ":c": new_code,
-            ":ls": now_epoch,
-            ":ttl": ttl_epoch,
-            ":z": 0,
-        },
-        ConditionExpression="attribute_exists(phone) AND attribute_exists(sessionId)",
-    )
 
 def _latest_session_for_phone(phone: str) -> Optional[dict]:
     try:
@@ -499,6 +475,14 @@ def _latest_session_for_phone(phone: str) -> Optional[dict]:
     except Exception:
         return None
 
+
+def _is_expired(item: dict, now_epoch: Optional[int] = None) -> bool:
+    if not item:
+        return True
+    now_epoch = now_epoch or int(time.time())
+    return now_epoch >= int(item.get("ttl", 0) or 0)
+
+
 def _send_sms_twilio(e164: str, text: str):
     if not twilio_client or not TWILIO_FROM_NUMBER:
         raise HTTPException(status_code=500, detail="Twilio not configured")
@@ -507,9 +491,9 @@ def _send_sms_twilio(e164: str, text: str):
     except Exception as e:
         log.exception("Twilio send failed to %s", e164)
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to send OTP via Twilio: {str(e)}",
+            status_code=500, detail=f"Failed to send OTP via Twilio: {str(e)}"
         )
+
 
 def _send_sms_sns(e164: str, text: str):
     attrs = {
@@ -543,14 +527,15 @@ def _send_sms_sns(e164: str, text: str):
     except Exception as e:
         log.exception("SNS publish failed to %s", e164)
         raise HTTPException(
-            status_code=500,
-            detail=f"Failed to send OTP via SNS: {str(e)}",
+            status_code=500, detail=f"Failed to send OTP via SNS: {str(e)}"
         )
+
 
 def _send_sms(e164: str, text: str):
     if SMS_PROVIDER == "twilio":
         return _send_sms_twilio(e164, text)
     return _send_sms_sns(e164, text)
+
 
 # -----------------------------------------------------------------------------#
 # Schemas                                                                       #
@@ -566,9 +551,11 @@ class SendOTPReq(BaseModel):
             raise ValueError("mobile required")
         return v
 
+
 class SendOTPResp(BaseModel):
     otpSessionId: str
     normalizedPhone: str
+
 
 class VerifyOTPReq(BaseModel):
     mobile: str
@@ -576,21 +563,17 @@ class VerifyOTPReq(BaseModel):
     code: str = Field(..., min_length=4, max_length=6)
     otpSessionId: Optional[str] = None
 
+
 class VerifyOTPResp(BaseModel):
     patientId: str
     normalizedPhone: str
+
 
 # -----------------------------------------------------------------------------#
 # Routes                                                                        #
 # -----------------------------------------------------------------------------#
 @router.post("/send-otp", response_model=SendOTPResp)
 def send_otp(req: SendOTPReq, x_kiosk_key: Optional[str] = Header(None)):
-    """
-    Send or resend OTP for a registered patient.
-    - Always generates a NEW code.
-    - Always extends TTL to now + OTP_TTL_SECONDS (5 minutes by default).
-    - Reuses the same sessionId per phone for simpler verification.
-    """
     phone = normalize_phone(req.mobile, req.countryCode)
     if not phone:
         raise HTTPException(status_code=400, detail="Invalid phone")
@@ -612,23 +595,66 @@ def send_otp(req: SendOTPReq, x_kiosk_key: Optional[str] = Header(None)):
     if not user_sub:
         raise HTTPException(status_code=500, detail="Cognito user missing sub")
 
+    now_epoch = int(time.time())
     existing = _latest_session_for_phone(phone)
+
+    # Case 1: existing session and not expired
+    if existing and not _is_expired(existing, now_epoch):
+        last_send = int(existing.get("lastSendAt", 0) or 0)
+        elapsed = now_epoch - last_send
+
+        # If still in cooldown window, refuse to send a new SMS
+        if elapsed < OTP_RESEND_COOLDOWN:
+            wait = OTP_RESEND_COOLDOWN - elapsed
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {wait} seconds before requesting a new OTP.",
+            )
+
+        # Cooldown has passed, session still valid -> rotate code & extend TTL
+        new_code = _gen_code(OTP_LENGTH)
+        ttl_epoch = now_epoch + OTP_TTL_SECONDS
+        try:
+            otp_table.update_item(
+                Key={"phone": existing["phone"], "sessionId": existing["sessionId"]},
+                UpdateExpression=(
+                    "SET #c = :c, #ls = :ls, #ttl = :ttl, attempts = :z"
+                ),
+                ExpressionAttributeNames={
+                    "#c": "code",
+                    "#ls": "lastSendAt",
+                    "#ttl": "ttl",
+                },
+                ExpressionAttributeValues={
+                    ":c": new_code,
+                    ":ls": now_epoch,
+                    ":ttl": ttl_epoch,
+                    ":z": 0,
+                },
+                ConditionExpression="attribute_exists(phone) AND attribute_exists(sessionId)",
+            )
+        except Exception:
+            log.exception("Failed to update OTP session; falling back to new session")
+            existing = None
+        else:
+            _send_sms(
+                phone,
+                f"{new_code} is your MedMitra verification code. It expires in {OTP_TTL_SECONDS // 60} min.",
+            )
+            return SendOTPResp(
+                otpSessionId=existing["sessionId"],
+                normalizedPhone=phone,
+            )
+
+    # Case 2: no session or expired / failed to update -> create fresh session
     code = _gen_code(OTP_LENGTH)
-
-    if existing:
-        # Resend path: update code + TTL + lastSendAt, reset attempts
-        _update_resend(existing, code)
-        session_id = existing["sessionId"]
-    else:
-        # First time: create new OTP session
-        session_id = _put_otp_session(phone, user_sub, code)
-
+    session_id = _put_otp_session(phone, user_sub, code)
     _send_sms(
         phone,
         f"{code} is your MedMitra verification code. It expires in {OTP_TTL_SECONDS // 60} min.",
     )
-
     return SendOTPResp(otpSessionId=session_id, normalizedPhone=phone)
+
 
 @router.post("/verify-otp", response_model=VerifyOTPResp)
 def verify_otp(req: VerifyOTPReq, x_kiosk_key: Optional[str] = Header(None)):
