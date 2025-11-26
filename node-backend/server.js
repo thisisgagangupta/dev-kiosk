@@ -5,6 +5,7 @@ import { kioskIdentifyRouter } from "./routes/kioskIdentify.js";
 const app = express();
 
 const defaultAllowed = [
+  "https://medmitra-frontend-qyc5.onrender.com",
   "http://localhost:5173",
   "http://127.0.0.1:5173",
   "http://localhost:8080",
