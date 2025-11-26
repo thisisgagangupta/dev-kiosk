@@ -16,22 +16,22 @@ const runtimeOverride =
   localStorage.getItem("API_BASE_URL_OVERRIDE") ||
   "";
 
-const rawBase =
+  const rawBase =
   runtimeOverride ||
-  (import.meta as any)?.env?.VITE_API_BASE ||
-  (import.meta as any)?.env?.VITE_API_BASE_URL ||
+  import.meta.env.VITE_VOICE_BASE ||
+  import.meta.env.VITE_API_BASE ||
+  import.meta.env.VITE_API_BASE_URL ||
   "";
 
 // only allow localhost fallback when you're truly on localhost
-const API_BASE_URL = (
-  rawBase
-).replace(/\/+$/, "");
+const API_BASE_URL = rawBase.replace(/\/+$/, "");
 
 console.log("[voice] API_BASE_URL:", API_BASE_URL);
 if (!API_BASE_URL && location.hostname !== "localhost") {
-  console.warn("[voice] Missing API base. Set VITE_API_BASE(_URL) or use ?api= override.");
+  console.warn(
+    "[voice] Missing API base. Set VITE_VOICE_BASE or VITE_API_BASE(_URL) or use ?api= override."
+  );
 }
-// ----- END robust API base resolution -----
 
 
 /** Map UI language to ISO-639-1 hints for the STT endpoint. */
