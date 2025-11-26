@@ -45,5 +45,5 @@ services:
     autoDeploy: true
     routes:
       - type: rewrite
-        source: /.*
+        source: /*
         destination: /index.html
