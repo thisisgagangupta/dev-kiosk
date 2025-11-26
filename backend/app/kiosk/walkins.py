@@ -345,28 +345,36 @@ class WalkinSendOtpResponse(BaseModel):
 @router.post("/walkins/send-otp", response_model=WalkinSendOtpResponse)
 def walkin_send_otp(payload: WalkinSendOtpRequest):
     """
-    Send OTP for walk-in registration. Can be used even before a Cognito user exists.
-    Frontend should call this before /walkins/register when WALKIN_REQUIRE_OTP is true.
+    Send OTP for walk-in registration (used across WalkinPage, LabPage, PharmacyPage,
+    DiagnosticsBookingPage).
+    Behaviour:
+      - Every call generates a NEW code.
+      - TTL is always refreshed to now + OTP_TTL_SECONDS (5 minutes default).
+      - We reuse the same sessionId per phone where possible so verification is simple.
     """
     phone = _norm_e164(payload.mobile, payload.countryCode or "+91")
     if not phone:
         raise HTTPException(status_code=400, detail="Invalid phone number")
 
     existing = _latest_walkin_session_for_phone(phone)
-    code = _gen_otp_code()
-    if existing and _can_resend(existing):
+    code = _gen_otp_code()  # generate a new code every time
+
+    if existing:
+        # Resend path: update existing row with new code + TTL + lastSendAt
         _update_walkin_resend(existing, code)
         session_id = existing["sessionId"]
-    elif existing and not _can_resend(existing):
-        # Respect cooldown but still return existing session id
-        session_id = existing["sessionId"]
-        code = str(existing.get("code") or code)
     else:
+        # First send: create session
         session_id = _put_walkin_otp_session(phone, code)
 
-    _send_sms(phone, f"{code} is your MedMitra verification code for walk-in registration. It expires in {OTP_TTL_SECONDS // 60} min.")
+    _send_sms(
+        phone,
+        f"{code} is your MedMitra verification code for walk-in registration. "
+        f"It expires in {OTP_TTL_SECONDS // 60} min.",
+    )
 
     return WalkinSendOtpResponse(otpSessionId=session_id, normalizedPhone=phone)
+
 
 
 # ---------------- Route: Walk-in registration ----------------
