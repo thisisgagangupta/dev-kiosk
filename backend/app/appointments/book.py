@@ -1,19 +1,18 @@
-# backend/app/appointments/book.py
 import os
 import json
 import uuid
 import logging
-from app.util.datetime import now_utc_iso, now_epoch_ms, combine_local_to_utc_iso
 from typing import Optional, Dict, Any
-from datetime import datetime
+
 import boto3
 from botocore.exceptions import ClientError
+from boto3.dynamodb.conditions import Key  # NEW
+
 from fastapi import APIRouter, HTTPException, Body
 from pydantic import BaseModel, Field, constr
-from zoneinfo import ZoneInfo
 
-from app.util.datetime import now_utc_iso, now_epoch_ms, combine_local_to_utc_iso
-from app.notifications.whatsapp import send_doctor_booking_confirmation
+from app.util.datetime import now_utc_iso, now_epoch_ms
+from app.notifications.whatsapp import send_consecutive_appointment_warning  # NEW
 
 log = logging.getLogger("appt-book")
 router = APIRouter(prefix="/appointments", tags=["appointments"])
@@ -26,24 +25,26 @@ S3_PREFIX_APPTS = os.getenv("S3_PREFIX_APPTS", "appointments").strip().strip("/"
 
 DYNAMODB_ENDPOINT = (os.getenv("DYNAMODB_LOCAL_URL") or "").strip() or None
 
+
 def _ddb():
     kw = {"region_name": AWS_REGION}
     if DYNAMODB_ENDPOINT:
         kw["endpoint_url"] = DYNAMODB_ENDPOINT
     return boto3.resource("dynamodb", **kw)
 
+
 ddb = _ddb()
 tbl_appts = ddb.Table(DDB_TABLE_APPTS)
 tbl_slots = ddb.Table(DDB_TABLE_SLOTS)
 s3 = boto3.client("s3", region_name=AWS_REGION) if S3_BUCKET else None
 
-TZ = os.getenv("CLINIC_TIME_ZONE", "Asia/Kolkata")
 
-# -------- Schemas (doctor flow parity with patient portal) ----------
+# -------- Schemas (doctor flow parity with patient portal) --------
 class Contact(BaseModel):
     name: Optional[str] = ""
     phone: Optional[str] = ""
     email: Optional[str] = ""
+
 
 class AppointmentDetails(BaseModel):
     dateISO: constr(strip_whitespace=True, max_length=32)     # "YYYY-MM-DD"
@@ -55,14 +56,17 @@ class AppointmentDetails(BaseModel):
     consultationType: Optional[str] = "in-person"             # "in-person" | "video"
     appointmentType: Optional[str] = "walkin"                 # "walkin" | ...
 
+
 class BookRequest(BaseModel):
     patientId: constr(strip_whitespace=True, min_length=6)
     contact: Optional[Contact] = None
     appointment_details: AppointmentDetails
     source: Optional[str] = "kiosk"
 
+
 def _slot_key(date_iso: str, time_slot: str) -> str:
     return f"{date_iso}#{time_slot}"
+
 
 def _lock_slot(resource_key: str, slot_key: str, patient_id: str, appointment_id: str):
     item = {
@@ -74,6 +78,88 @@ def _lock_slot(resource_key: str, slot_key: str, patient_id: str, appointment_id
     }
     tbl_slots.put_item(Item=item, ConditionExpression="attribute_not_exists(slotKey)")
 
+
+# ---------- NEW: helpers for consecutive warning ----------
+
+def _get_details_map(it: Dict[str, Any]) -> Dict[str, Any]:
+    """Safely parse appointment_details into a dict."""
+    raw = it.get("appointment_details")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _find_existing_same_day_appointment(
+    table,
+    patient_id: str,
+    date_iso: str,
+    exclude_appointment_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort: find an existing *other* doctor appointment for this patient
+    on the same date. Used to trigger the consecutive-booking warning.
+    """
+    try:
+        resp = table.query(
+            KeyConditionExpression=Key("patientId").eq(patient_id),
+            ScanIndexForward=False,
+            Limit=50,
+        )
+    except ClientError as e:
+        log.warning(
+            "Existing same-day lookup failed for patient %s: %s",
+            patient_id,
+            e,
+        )
+        return None
+
+    for it in resp.get("Items", []):
+        # skip the appointment we just created
+        if it.get("appointmentId") == exclude_appointment_id:
+            continue
+
+        record_type = (it.get("recordType") or "doctor").lower()
+        if record_type != "doctor":
+            continue
+
+        status = str(it.get("status") or "").upper()
+        if status in ("CANCELLED", "CANCELED"):
+            continue
+
+        details = _get_details_map(it)
+        existing_date = (
+            it.get("dateISO")
+            or details.get("dateISO")
+            or (it.get("collection") or {}).get("preferredDateISO")
+        )
+        if existing_date != date_iso:
+            continue
+
+        existing_time = (
+            it.get("timeSlot")
+            or details.get("timeSlot")
+            or (it.get("collection") or {}).get("preferredSlot")
+            or ""
+        )
+
+        return {
+            "dateISO": existing_date,
+            "timeSlot": existing_time,
+            "doctorName": it.get("doctorName") or details.get("doctorName") or "",
+            "clinicName": it.get("clinicName") or details.get("clinicName") or "",
+        }
+
+    return None
+
+
+# ---------- Main route ----------
+
 @router.post("/book")
 def book_appointment(payload: BookRequest = Body(...)):
     appt = payload.appointment_details
@@ -84,14 +170,31 @@ def book_appointment(payload: BookRequest = Body(...)):
     slot_key = _slot_key(appt.dateISO, appt.timeSlot)
     resource_key = f"doctor#{appt.doctorId}"
 
+    # Determine whether this is a kiosk walk-in flow
+    source_lower = (payload.source or "").lower()
+    is_kiosk_walkin = source_lower == "kiosk" and (appt.appointmentType or "").lower() == "walkin"
+
+    # Status semantics:
+    # - kiosk walk-in: PENDING_PAYMENT (will become BOOKED after payment/choice)
+    # - everything else: BOOKED (portal / AI / non-kiosk callers)
+    initial_status = "PENDING_PAYMENT" if is_kiosk_walkin else "BOOKED"
+
     # 1) lock slot
     try:
-        _lock_slot(resource_key, slot_key, payload.patientId, appointment_id)
+        # IMPORTANT:
+        # For kiosk walk-ins we DO NOT lock the slot yet.
+        # We only create a PENDING_PAYMENT appointment, and treat the slot
+        # as still available until payment / pay-later choice is made.
+        if not is_kiosk_walkin:
+            _lock_slot(resource_key, slot_key, payload.patientId, appointment_id)
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
             raise HTTPException(status_code=409, detail="Selected time slot is no longer available")
         log.exception("Slot lock error")
-        raise HTTPException(status_code=500, detail=e.response.get("Error", {}).get("Message", str(e)))
+        raise HTTPException(
+            status_code=500,
+            detail=e.response.get("Error", {}).get("Message", str(e)),
+        )
 
     # 2) write appointment
     created_at = now_utc_iso()
@@ -101,9 +204,9 @@ def book_appointment(payload: BookRequest = Body(...)):
         "createdAt": created_at,
         "createdAtEpoch": now_epoch_ms(),
         "recordType": "doctor",
-        "status": "BOOKED",
+        "status": initial_status,
         "source": payload.source or "kiosk",
-        "timeZone": TZ,
+        "timeZone": os.getenv("CLINIC_TIME_ZONE", "Asia/Kolkata"),
         "contact": payload.contact.dict() if payload.contact else None,
         "appointment_details": appt.dict(),
         # quick query keys
@@ -117,13 +220,17 @@ def book_appointment(payload: BookRequest = Body(...)):
             ConditionExpression="attribute_not_exists(patientId) AND attribute_not_exists(appointmentId)"
         )
     except ClientError as e:
-        # rollback slot on failure
+        # rollback slot on failure (for non-kiosk only – kiosk may not have locked)
         try:
-            tbl_slots.delete_item(Key={"resourceKey": resource_key, "slotKey": slot_key})
+            if not is_kiosk_walkin:
+                tbl_slots.delete_item(Key={"resourceKey": resource_key, "slotKey": slot_key})
         except Exception:
             pass
         log.exception("Dynamo put_item failed")
-        raise HTTPException(status_code=500, detail=e.response.get("Error", {}).get("Message", str(e)))
+        raise HTTPException(
+            status_code=500,
+            detail=e.response.get("Error", {}).get("Message", str(e)),
+        )
 
     # 3) archive to S3 (optional, best effort)
     if s3 and S3_BUCKET:
@@ -139,31 +246,35 @@ def book_appointment(payload: BookRequest = Body(...)):
         except Exception:
             log.warning("S3 archive failed for %s/%s", payload.patientId, appointment_id, exc_info=True)
 
-    # 4) WhatsApp doctor booking confirmation (kiosk)
+    # 4) NEW: send ONLY consecutive-appointment warning here (kiosk walk-in)
     try:
-        contact = item.get("contact") or {}
-        phone = (contact.get("phone") or "").strip()
-        # Only send if we have a phone and a valid date/time
-        if phone and appt.dateISO and appt.timeSlot:
-            tz = ZoneInfo(os.getenv("CLINIC_TIME_ZONE", "Asia/Kolkata"))
-            try:
-                y, m, d = [int(x) for x in appt.dateISO.split("-", 2)]
-                hh, mm = [int(x) for x in appt.timeSlot.split(":", 1)]
-                when_local = datetime(y, m, d, hh, mm, tzinfo=tz)
-            except Exception:
-                # Fallback: just use "now" in clinic timezone
-                when_local = datetime.now(tz)
-
-            send_doctor_booking_confirmation(
-                phone_e164=phone,
-                patient_name=contact.get("name") or "",
-                when_local=when_local,
-                doctor_name=appt.doctorName or "",
-                clinic_name=appt.clinicName or "",
+        if is_kiosk_walkin:
+            existing = _find_existing_same_day_appointment(
+                tbl_appts,
+                payload.patientId,
+                appt.dateISO,
+                exclude_appointment_id=appointment_id,
             )
-    except Exception:
-        log.warning("Failed to send WhatsApp doctor booking confirmation", exc_info=True)
 
+            if existing:
+                contact = payload.contact.dict() if payload.contact else {}
+                phone = (contact.get("phone") or "").strip()
+                patient_name = contact.get("name") or ""
+
+                send_consecutive_appointment_warning(
+                    phone_e164=phone,
+                    patient_name=patient_name,
+                    date_iso=existing.get("dateISO") or appt.dateISO,
+                    existing_time=existing.get("timeSlot") or "",
+                    new_time=appt.timeSlot,
+                    doctor_name=existing.get("doctorName") or appt.doctorName,
+                    clinic_name=existing.get("clinicName") or appt.clinicName,
+                )
+    except Exception:
+        log.warning("Failed to send consecutive warning", exc_info=True)
+
+    # Final confirmation will be sent when kiosk payment
+    # info is attached via /api/kiosk/appointments/attach.
 
     return {
         "patientId": payload.patientId,

@@ -1,4 +1,3 @@
-// frontend/src/pages/FrontDeskCashPage.tsx
 import { useEffect, useState } from "react";
 import KioskLayout from "@/components/KioskLayout";
 import { Card } from "@/components/ui/card";
@@ -6,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableHead, TableHeader, TableRow, TableCell } from "@/components/ui/table";
 import { useToast } from "@/hooks/use-toast";
-import { IndianRupee, RefreshCw, CheckCircle, Clock } from "lucide-react";
+import { IndianRupee, RefreshCw, CheckCircle, Clock, XCircle } from "lucide-react";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string || "").replace(/\/+$/, "");
 
@@ -19,6 +18,7 @@ type CashPendingItem = {
   timeSlot?: string;
   amount?: number;
   status?: string;
+  patientName?: string;
 };
 
 type TokenResp = {
@@ -33,11 +33,55 @@ type TokenResp = {
   status: string;
 };
 
+function parseSortKey(row: CashPendingItem): number {
+  const d = (row.dateISO || "").trim();
+  const t = (row.timeSlot || "").trim();
+  if (!d) return Number.MAX_SAFE_INTEGER;
+  try {
+    const [hStr, mStr = "0"] = t ? t.split(":") : ["0", "0"];
+    const dt = new Date(`${d}T${hStr.padStart(2, "0")}:${mStr.padStart(2, "0")}:00`);
+    const ts = dt.getTime();
+    return Number.isNaN(ts) ? Number.MAX_SAFE_INTEGER : ts;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function formatDateTime(dateISO?: string, timeSlot?: string): string {
+  const d = (dateISO || "").trim();
+  const t = (timeSlot || "").trim();
+  if (!d && !t) return "—";
+  try {
+    if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) {
+      const [hStr, mStr = "0"] = t ? t.split(":") : ["0", "0"];
+      const dt = new Date(`${d}T${hStr.padStart(2, "0")}:${mStr.padStart(2, "0")}:00`);
+      const datePart = dt.toLocaleDateString(undefined, {
+        weekday: "short",
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+      });
+      const timePart = dt.toLocaleTimeString(undefined, {
+        hour: "numeric",
+        minute: "2-digit",
+      });
+      return t ? `${datePart} • ${timePart}` : datePart;
+    }
+  } catch {
+    // fall back to raw values below
+  }
+  if (d && t) return `${d} • ${t}`;
+  if (d) return d;
+  if (t) return t;
+  return "—";
+}
+
 export default function FrontDeskCashPage() {
   const { toast } = useToast();
   const [items, setItems] = useState<CashPendingItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [issuingId, setIssuingId] = useState<string | null>(null);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
   const [lastToken, setLastToken] = useState<TokenResp | null>(null);
 
   const loadData = async () => {
@@ -48,7 +92,16 @@ export default function FrontDeskCashPage() {
       if (!res.ok) {
         throw new Error(data?.detail || `Failed (${res.status})`);
       }
-      setItems(data || []);
+
+      const todayIso = new Date().toISOString().slice(0, 10);
+
+      const raw: CashPendingItem[] = (data || []) as CashPendingItem[];
+
+      // Filter to today's entries only, then sort by time
+      const todays = raw.filter((row) => (row.dateISO || "").slice(0, 10) === todayIso);
+      todays.sort((a, b) => parseSortKey(a) - parseSortKey(b));
+
+      setItems(todays);
     } catch (e: any) {
       toast({
         variant: "destructive",
@@ -103,10 +156,10 @@ export default function FrontDeskCashPage() {
       });
 
       // 3) Remove from local list
-      setItems(prev =>
+      setItems((prev) =>
         prev.filter(
-          i => !(i.patientId === row.patientId && i.appointmentId === row.appointmentId)
-        )
+          (i) => !(i.patientId === row.patientId && i.appointmentId === row.appointmentId),
+        ),
       );
     } catch (e: any) {
       toast({
@@ -119,6 +172,44 @@ export default function FrontDeskCashPage() {
     }
   };
 
+  const handleCancel = async (row: CashPendingItem) => {
+    setCancellingId(row.appointmentId);
+    try {
+      const res = await fetch(`${API_BASE}/api/frontdesk/cash/cancel`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          patientId: row.patientId,
+          appointmentId: row.appointmentId,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(data?.detail || `Failed to cancel (${res.status})`);
+      }
+
+      // Remove from list after successful cancel
+      setItems((prev) =>
+        prev.filter(
+          (i) => !(i.patientId === row.patientId && i.appointmentId === row.appointmentId),
+        ),
+      );
+
+      toast({
+        title: "Appointment Cancelled",
+        description: "The slot has been freed and this entry removed from the cash queue.",
+      });
+    } catch (e: any) {
+      toast({
+        variant: "destructive",
+        title: "Cancel failed",
+        description: e?.message || "Please try again.",
+      });
+    } finally {
+      setCancellingId(null);
+    }
+  };
+
   return (
     <KioskLayout title="Front Desk Cash">
       <div className="max-w-5xl mx-auto space-y-6">
@@ -126,7 +217,8 @@ export default function FrontDeskCashPage() {
           <div>
             <h1 className="text-2xl font-bold">Cash Payments Queue</h1>
             <p className="text-sm text-muted-foreground">
-              Patients who chose &ldquo;Pay at reception&rdquo; appear here. Collect cash, mark paid, and issue a token.
+              Patients who chose &ldquo;Pay at reception&rdquo; appear here. Collect cash, mark paid,
+              and issue a token, or cancel to free the slot.
             </p>
           </div>
           <Button variant="outline" onClick={loadData} disabled={loading}>
@@ -138,13 +230,13 @@ export default function FrontDeskCashPage() {
         <Card className="p-4">
           {items.length === 0 ? (
             <div className="text-center py-8 text-muted-foreground">
-              {loading ? "Loading..." : "No pending cash payments."}
+              {loading ? "Loading..." : "No pending cash payments for today."}
             </div>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Patient ID</TableHead>
+                  <TableHead>Patient</TableHead>
                   <TableHead>Clinic</TableHead>
                   <TableHead>Doctor</TableHead>
                   <TableHead>Date &amp; Time</TableHead>
@@ -153,55 +245,82 @@ export default function FrontDeskCashPage() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {items.map(row => (
-                  <TableRow key={`${row.patientId}-${row.appointmentId}`}>
-                    <TableCell className="text-xs">
-                      <div className="font-mono">{row.patientId}</div>
-                      <div className="text-[10px] text-muted-foreground truncate max-w-[140px]">
-                        Appt: {row.appointmentId}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="text-xs text-muted-foreground">
-                        {row.clinicName || "Clinic"}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="text-sm font-medium">{row.doctorName || "—"}</div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="text-xs">
-                        {row.dateISO || "—"}
-                        {row.timeSlot ? ` • ${row.timeSlot}` : ""}
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <div className="flex items-center justify-end gap-1 text-sm">
-                        <IndianRupee className="h-3 w-3" />
-                        <span>{row.amount ?? 0}</span>
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <Button
-                        size="sm"
-                        disabled={issuingId === row.appointmentId}
-                        onClick={() => handleSettleAndIssue(row)}
-                      >
-                        {issuingId === row.appointmentId ? (
-                          <>
-                            <Clock className="h-4 w-4 mr-1 animate-spin" />
-                            Processing...
-                          </>
-                        ) : (
-                          <>
-                            <CheckCircle className="h-4 w-4 mr-1" />
-                            Collect &amp; Issue Token
-                          </>
-                        )}
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {items.map((row) => {
+                  const sortKey = parseSortKey(row); // not used in UI but keeps compiler happy if needed
+                  const label = formatDateTime(row.dateISO, row.timeSlot);
+                  return (
+                    <TableRow key={`${row.patientId}-${row.appointmentId}`}>
+                      <TableCell className="text-xs">
+                        <div className="font-medium text-sm">
+                          {row.patientName?.trim() || "Patient"}
+                        </div>
+                        <div className="font-mono text-[11px] text-muted-foreground">
+                          {row.patientId}
+                        </div>
+                        <div className="text-[10px] text-muted-foreground truncate max-w-[160px]">
+                          Appt: {row.appointmentId}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="text-xs text-muted-foreground">
+                          {row.clinicName || "Clinic"}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="text-sm font-medium">
+                          {row.doctorName || "—"}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="text-xs">{label}</div>
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <div className="flex items-center justify-end gap-1 text-sm">
+                          <IndianRupee className="h-3 w-3" />
+                          <span>{row.amount ?? 0}</span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-right space-x-2">
+                        <Button
+                          size="sm"
+                          disabled={issuingId === row.appointmentId}
+                          onClick={() => handleSettleAndIssue(row)}
+                        >
+                          {issuingId === row.appointmentId ? (
+                            <>
+                              <Clock className="h-4 w-4 mr-1 animate-spin" />
+                              Processing...
+                            </>
+                          ) : (
+                            <>
+                              <CheckCircle className="h-4 w-4 mr-1" />
+                              Collect &amp; Issue Token
+                            </>
+                          )}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="border-destructive text-destructive hover:bg-destructive/5"
+                          disabled={cancellingId === row.appointmentId}
+                          onClick={() => handleCancel(row)}
+                        >
+                          {cancellingId === row.appointmentId ? (
+                            <>
+                              <Clock className="h-4 w-4 mr-1 animate-spin" />
+                              Cancelling...
+                            </>
+                          ) : (
+                            <>
+                              <XCircle className="h-4 w-4 mr-1" />
+                              Cancel
+                            </>
+                          )}
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           )}
@@ -220,7 +339,9 @@ export default function FrontDeskCashPage() {
                 </div>
               </div>
               <div className="text-right text-sm text-muted-foreground">
-                <div>ETA: {lastToken.etaLow}-{lastToken.etaHigh} min</div>
+                <div>
+                  ETA: {lastToken.etaLow}-{lastToken.etaHigh} min
+                </div>
                 <div>Confidence: {lastToken.confidence}%</div>
               </div>
             </div>

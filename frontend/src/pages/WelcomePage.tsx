@@ -10,6 +10,7 @@ import {
   TestTube,
   Pill,
   Activity,
+  MessageCircle,
 } from "lucide-react";
 import KioskLayout from "@/components/KioskLayout";
 import {
@@ -18,11 +19,22 @@ import {
   setStoredLanguage,
   type Language,
 } from "@/lib/i18n";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
+
+const WHATSAPP_QR_SRC =
+  "https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=https%3A%2F%2Fwa.me%2F16206701378%3Ftext%3DHi%2520Medmitra";
 
 export default function WelcomePage() {
   const navigate = useNavigate();
   const [language, setLanguage] = useState<Language>(getStoredLanguage());
   const { t } = useTranslation(language);
+  const [showWhatsAppDialog, setShowWhatsAppDialog] = useState(false);
 
   const handleLanguageSelect = (lang: Language) => {
     setLanguage(lang);
@@ -64,10 +76,21 @@ export default function WelcomePage() {
 
   return (
     <KioskLayout
-      title={t("welcome.title")}
+      // title={t("welcome.title")}
       showBack={false}
       showLanguage={true}
       onBack={() => navigate("/idle")}
+      headerRightExtra={
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setShowWhatsAppDialog(true)}
+          className="flex items-center gap-2 min-w-[120px]"
+        >
+          <MessageCircle className="h-4 w-4 text-green-600" />
+          <span className="hidden sm:inline">WhatsApp</span>
+        </Button>
+      }
     >
       <div className="max-w-4xl mx-auto">
         {/* Welcome Header */}
@@ -111,7 +134,11 @@ export default function WelcomePage() {
           {options.map((option, index) => (
             <Card
               key={index}
-              className="p-8 cursor-pointer hover:shadow-kiosk transition-all duration-300 transform hover:scale-105 group"
+              className={`p-8 cursor-pointer hover:shadow-kiosk transition-all duration-300 transform hover:scale-105 group ${
+                index === options.length - 1
+                  ? "md:col-span-2 md:w-1/2 md:justify-self-center"
+                  : ""
+              }`}
               onClick={option.action}
             >
               <div className="text-center">
@@ -147,6 +174,39 @@ export default function WelcomePage() {
           </div>
         </Card>
       </div>
+
+      {/* WhatsApp promo dialog (QR only) */}
+      <Dialog open={showWhatsAppDialog} onOpenChange={setShowWhatsAppDialog}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <MessageCircle className="h-5 w-5 text-green-600" />
+              Chat with MedMitra on WhatsApp
+            </DialogTitle>
+            <DialogDescription>
+  Scan this QR code with your phone&apos;s camera to start a WhatsApp chat
+  with MedMitra&apos;s AI companion.<br /> 
+  Get quick answers, visit assistance,
+  appointment help, and personalized guidance on your phone.
+</DialogDescription>
+
+          </DialogHeader>
+
+          <div className="flex flex-col items-center gap-4 py-4">
+            <div className="rounded-2xl bg-white p-4 shadow-card">
+              <img
+                src={WHATSAPP_QR_SRC}
+                alt="Scan to open MedMitra WhatsApp chat"
+                className="w-56 h-56"
+              />
+            </div>
+
+            <p className="text-xs text-muted-foreground text-center">
+              WhatsApp number: <span className="font-mono">+1 620 670 1378</span>
+            </p>
+          </div>
+        </DialogContent>
+      </Dialog>
     </KioskLayout>
   );
 }

@@ -46,8 +46,13 @@ def _patients_table():
     return ddb.Table(DDB_TABLE_PATIENTS)
 
 
-def _coerce_str(v: Optional[str]) -> str:
-    return (v or "").strip()
+# def _coerce_str(v: Optional[str]) -> str:
+#     return (v or "").strip()
+def _coerce_str(v: Any) -> str:
+    if v is None:
+        return ""
+    # Convert Decimals / ints / anything else to str, then strip
+    return str(v).strip()
 
 
 def _normalize_phone(mobile: str, country_code: str = "+91") -> str:

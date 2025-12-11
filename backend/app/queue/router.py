@@ -142,15 +142,29 @@ def issue_token(body: IssueTokenReq = Body(...)):
         pos = _count_ahead(t["date"], t["lane"], int(t["seq"]))
         eta = _estimate_eta(pos)
         return IssueTokenResp(
-            tokenNo=t["tokenNo"], lane=t["lane"], position=pos,
-            etaLow=eta["etaLow"], etaHigh=eta["etaHigh"], confidence=eta["confidence"],
-            appointmentId=body.appointmentId, patientId=body.patientId, status=t.get("status","waiting")
+            tokenNo=t["tokenNo"],
+            lane=t["lane"],
+            position=pos,
+            etaLow=eta["etaLow"],
+            etaHigh=eta["etaHigh"],
+            confidence=eta["confidence"],
+            appointmentId=body.appointmentId,
+            patientId=body.patientId,
+            status=t.get("status", "waiting"),
         )
 
-    # 2) Compute day & lane (robust to string or map appointment_details)
+    # 2) Compute day & lane + timeSlot (robust to string or map appointment_details)
     details = _get_appointment_details(appt)
     date_iso = _today_local(appt.get("dateISO") or details.get("dateISO"))
     doctor_id = appt.get("doctorId") or details.get("doctorId")
+    # NEW: extract time slot once and reuse (doctor and lab flows)
+    collection = appt.get("collection") or {}
+    time_slot = (
+        appt.get("timeSlot")
+        or details.get("timeSlot")
+        or collection.get("preferredSlot")
+        or ""
+    )
     lane = _lane_for_doctor(doctor_id)
 
     # 3) Allocate next sequence (atomic)
@@ -161,7 +175,7 @@ def issue_token(body: IssueTokenReq = Body(...)):
     ahead = _count_ahead(date_iso, lane, seq)
     eta = _estimate_eta(ahead)
 
-    # 5) Persist token
+    # 5) Persist token (NEW: include timeSlot)
     item = {
         "tokenId": str(uuid.uuid4()),
         "tokenNo": token_no,
@@ -175,6 +189,7 @@ def issue_token(body: IssueTokenReq = Body(...)):
         "issuedAt": now_utc_iso(),
         "etaLow": eta["etaLow"],
         "etaHigh": eta["etaHigh"],
+        "timeSlot": str(time_slot or ""),  # <── NEW
         "GSI1PK": body.appointmentId,
         "GSI1SK": now_utc_iso(),
         "GSI2PK": f"{date_iso}#{lane}",
@@ -195,7 +210,7 @@ def issue_token(body: IssueTokenReq = Body(...)):
             tz = ZoneInfo(os.getenv("CLINIC_TIME_ZONE", "Asia/Kolkata"))
 
             # Extract date/time similar to reminder lambda
-            details_local = _get_appointment_details(appt)
+            details_local = details
             collection = appt.get("collection") or {}
             date_iso_full = (
                 appt.get("dateISO")
@@ -203,16 +218,16 @@ def issue_token(body: IssueTokenReq = Body(...)):
                 or collection.get("preferredDateISO")
                 or ""
             )
-            time_slot = (
+            time_slot_local = (
                 appt.get("timeSlot")
                 or details_local.get("timeSlot")
                 or collection.get("preferredSlot")
                 or ""
             )
 
-            if date_iso_full and time_slot and record_type == "doctor":
+            if date_iso_full and time_slot_local and record_type == "doctor":
                 y, m, d = [int(x) for x in date_iso_full.split("-", 2)]
-                hh, mm = [int(x) for x in time_slot.split(":", 1)]
+                hh, mm = [int(x) for x in time_slot_local.split(":", 1)]
                 when_local = datetime(y, m, d, hh, mm, tzinfo=tz)
                 doctor_name = (
                     details_local.get("doctorName")
@@ -238,10 +253,16 @@ def issue_token(body: IssueTokenReq = Body(...)):
         log.warning("Failed to send WhatsApp check-in confirmation", exc_info=True)
 
     return IssueTokenResp(
-    tokenNo=token_no, lane=lane, position=ahead,
-    etaLow=eta["etaLow"], etaHigh=eta["etaHigh"], confidence=eta["confidence"],
-    appointmentId=body.appointmentId, patientId=body.patientId, status="waiting",
-)
+        tokenNo=token_no,
+        lane=lane,
+        position=ahead,
+        etaLow=eta["etaLow"],
+        etaHigh=eta["etaHigh"],
+        confidence=eta["confidence"],
+        appointmentId=body.appointmentId,
+        patientId=body.patientId,
+        status="waiting",
+    )
 
 
 class StatusResp(BaseModel):
@@ -254,20 +275,33 @@ class StatusResp(BaseModel):
 
 @router.get("/queue/status", response_model=StatusResp)
 def queue_status(tokenNo: str = Query(..., min_length=2)):
-    res = tbl_tokens.query(IndexName="GSI3", KeyConditionExpression=Key("GSI3PK").eq(tokenNo), Limit=1, ScanIndexForward=False)
+    res = tbl_tokens.query(
+        IndexName="GSI3",
+        KeyConditionExpression=Key("GSI3PK").eq(tokenNo),
+        Limit=1,
+        ScanIndexForward=False,
+    )
     items = res.get("Items", [])
     if not items:
         raise HTTPException(status_code=404, detail="Token not found")
     t = items[0]
     pos = _count_ahead(t["date"], t["lane"], int(t["seq"]))
     eta = _estimate_eta(pos)
-    return StatusResp(tokenNo=tokenNo, position=pos, etaLow=eta["etaLow"], etaHigh=eta["etaHigh"], confidence=eta["confidence"], status=t.get("status","waiting"))
+    return StatusResp(
+        tokenNo=tokenNo,
+        position=pos,
+        etaLow=eta["etaLow"],
+        etaHigh=eta["etaHigh"],
+        confidence=eta["confidence"],
+        status=t.get("status", "waiting"),
+    )
 
 class NowNextLane(BaseModel):
     lane: str
     now: List[str] = []
-    nxt: List[str] = []
+    next: List[str] = []
     avg_wait: int
+    tokenTimes: Dict[str, str] = {}  # NEW
 
 @router.get("/wallboard/now-next")
 def wallboard_now_next(date: Optional[str] = Query(None), lane: Optional[str] = Query(None)):
@@ -279,14 +313,27 @@ def wallboard_now_next(date: Optional[str] = Query(None), lane: Optional[str] = 
             IndexName="GSI2",
             KeyConditionExpression=Key("GSI2PK").eq(f"{day}#{ln}"),
             FilterExpression=Attr("status").is_in(["waiting","called","roomed"]),
-            Limit=20
+            Limit=20,
         )
         arr = sorted(q.get("Items", []), key=lambda x: int(x.get("seq", 0)))
         waiting = [i["tokenNo"] for i in arr if i.get("status") == "waiting"]
-        out.append({
-            "lane": ln,
-            "now": waiting[:1],
-            "next": waiting[1:6],
-            "avg_wait": AVG_CONSULT_MIN
-        })
+
+        # NEW: build token → timeSlot map (for waiting tokens only)
+        token_times: Dict[str, str] = {}
+        for i in arr:
+            if i.get("status") == "waiting":
+                tno = i.get("tokenNo")
+                ts = (i.get("timeSlot") or "").strip()
+                if tno and ts:
+                    token_times[tno] = ts
+
+        out.append(
+            {
+                "lane": ln,
+                "now": waiting[:1],
+                "next": waiting[1:6],
+                "avg_wait": AVG_CONSULT_MIN,
+                "tokenTimes": token_times,  # NEW
+            }
+        )
     return {"items": out}

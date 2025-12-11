@@ -1,8 +1,14 @@
+import { useEffect } from "react";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import {
+  BrowserRouter,
+  Routes,
+  Route,
+  useLocation,
+} from "react-router-dom";
 
 // Kiosk Pages
 import WelcomePage from "./pages/WelcomePage";
@@ -29,12 +35,27 @@ import FrontDeskCashPage from "./pages/FrontDeskCashPage";
 
 const queryClient = new QueryClient();
 
+/**
+ * Scrolls window to top whenever the route (pathname) changes.
+ */
+function ScrollToTop() {
+  const location = useLocation();
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }, [location.pathname]);
+
+  return null;
+}
+
 const App = () => (
   <QueryClientProvider client={queryClient}>
     <TooltipProvider>
       <Toaster />
       <Sonner />
       <BrowserRouter>
+        {/* Ensure each route change starts at top of the page */}
+        <ScrollToTop />
         <Routes>
           {/* Kiosk Routes */}
           <Route path="/" element={<WelcomePage />} />
@@ -46,7 +67,10 @@ const App = () => (
           <Route path="/reason" element={<ReasonPage />} />
           {/* <Route path="/pay" element={<PaymentPage />} /> */}
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
-          <Route path="/diagnostics-booking" element={<DiagnosticsBookingPage />} />
+          <Route
+            path="/diagnostics-booking"
+            element={<DiagnosticsBookingPage />}
+          />
           <Route path="/payment" element={<PaymentPage />} />
           <Route path="/token" element={<TokenPage />} />
           <Route path="/queue" element={<QueuePage />} />
